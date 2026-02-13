@@ -19,6 +19,7 @@ import glob
 import math
 import sys
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qs
+
 # =========================================================
 # CLASS UTAMA: DownloaderBot
 # =========================================================
@@ -42,7 +43,10 @@ class DownloaderBot:
     def __del__(self):
         # Pastikan driver dihentikan dan folder temp dihapus saat objek dihancurkan
         if self.driver:
-            self.driver.quit()
+            try:
+                self.driver.quit()
+            except:
+                pass
         shutil.rmtree(self.temp_download_dir, ignore_errors=True)
         
     # =========================================================
@@ -82,7 +86,7 @@ class DownloaderBot:
                    "text": message_text, "parse_mode": "Markdown"}
         try:
             requests.post(url, json=payload, timeout=10)
-        except Exception as e:
+        except Exception:
             pass 
 
     def _get_total_file_size_safe(self, url):
@@ -307,6 +311,7 @@ class DownloaderBot:
         except Exception as e:
             print(f"❌ Gagal inisialisasi Selenium Driver: {e}")
             return False
+
     def _process_selenium_download(self):
         """
         Menangani Gofile, Mediafire, dan AGGRESIVE CLICKING.
@@ -321,26 +326,27 @@ class DownloaderBot:
 
         # --- LOGIKA KHUSUS MEDIAFIRE ---
         if "mediafire" in url:
-            FORM_SELECTOR_STEP_1 = "form.dl-btn-form" 
             SELECTOR_STEP_2 = "#downloadButton"
 
-            self._edit_telegram_message("⬇️ **[MediaFire Mode]** Mencari dan mengirimkan FORM Step 1...")
-            try:
-                form_element = WebDriverWait(driver, 20).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, FORM_SELECTOR_STEP_1))
-                )
-                form_element.submit()
-            except TimeoutException:
-                raise TimeoutException(f"Gagal menemukan FORM MediaFire '{FORM_SELECTOR_STEP_1}'.")
-
-            self._edit_telegram_message("🔍 **[MediaFire Mode]** Halaman kedua dimuat. Mengekstrak URL Download Langsung...")
+            self._edit_telegram_message("🔍 **[MediaFire Mode]** Mengekstrak URL Download Langsung...")
             
+            # Opsional: Jika Mediafire membungkusnya dalam form, kita coba klik.
+            # Kita pass jika tidak ada, karena sebagian besar Mediafire pakai tombol direct
             try:
+                form_element = driver.find_element(By.CSS_SELECTOR, "form.dl-btn-form")
+                form_element.submit()
+                time.sleep(3) # Tunggu efek klik
+            except NoSuchElementException:
+                pass 
+
+            try:
+                # Menunggu tombol download ID=downloadButton muncul
                 download_button = WebDriverWait(driver, 20).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, SELECTOR_STEP_2))
+                    EC.presence_of_element_located((By.ID, "downloadButton"))
                 )
                 final_download_url = download_button.get_attribute('href')
-                if not final_download_url: raise Exception("Atribut 'href' pada tombol download kosong.")
+                if not final_download_url: 
+                    raise Exception("Atribut 'href' pada tombol download kosong.")
 
                 file_name = self._extract_filename_from_url_or_header(final_download_url)
                 
@@ -526,7 +532,6 @@ class DownloaderBot:
         time.sleep(5) 
         
         html_content = driver.page_source
-        
             
         print("\n--- RESPONS HTML DARI SUBMIT FORM F1 ---")
         print(html_content)
@@ -598,6 +603,7 @@ class DownloaderBot:
             return downloaded_filename
         else:
             raise Exception("Aria2c gagal mengunduh file.")
+
     # =========================================================
     # --- 4. MAIN ORCHESTRATOR (run) ---
     # =========================================================
