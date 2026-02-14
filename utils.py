@@ -6,7 +6,7 @@ import shutil
 import requests
 from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-from playwright_stealth import stealth_async
+from playwright_stealth import stealth
 
 class DownloaderBotAsync:
     def __init__(self, url):
