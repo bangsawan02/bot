@@ -26,9 +26,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-# -----------------------------------------------------------------------------
-# --- PYTHON SETUP (FIXED VERSION + PIP CACHE) ---
-# -----------------------------------------------------------------------------
+# =========================================================
+# PYTHON SETUP
+# =========================================================
 
       - name: Set up Python
         id: setup-python
@@ -37,28 +37,26 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Check Python version
-        run: python --version
-
-# -----------------------------------------------------------------------------
-# --- APT & MEGATOOLS (CONDITIONAL) ---
-# -----------------------------------------------------------------------------
+# =========================================================
+# APT CACHE + MEGATOOLS
+# =========================================================
 
       - name: Grant permissions to APT cache
         run: |
           sudo chown -R $USER:$USER /var/cache/apt
           sudo chown -R $USER:$USER /var/lib/apt
-          if [ -f "man-db-fast.sh" ]; then chmod +x man-db-fast.sh && sh man-db-fast.sh; fi
 
-      - name: Cache APT packages
+      - name: Restore APT cache
         if: contains(env.PAYLOAD_URL, 'mega.nz')
-        uses: actions/cache@v3
+        id: restore-apt
+        uses: actions/cache/restore@v3
         with:
           path: |
             /var/cache/apt/archives
             /var/lib/apt/lists
           key: ${{ runner.os }}-apt-megatools
-          restore-keys: ${{ runner.os }}-apt-
+          restore-keys: |
+            ${{ runner.os }}-apt-
 
       - name: Install megatools
         if: contains(env.PAYLOAD_URL, 'mega.nz')
@@ -66,23 +64,27 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y megatools
 
-# -----------------------------------------------------------------------------
-# --- OPTIONAL YOUTUBE COOKIES ---
-# -----------------------------------------------------------------------------
+      - name: Save APT cache (Always)
+        if: always() && contains(env.PAYLOAD_URL, 'mega.nz')
+        uses: actions/cache/save@v3
+        with:
+          path: |
+            /var/cache/apt/archives
+            /var/lib/apt/lists
+          key: ${{ runner.os }}-apt-megatools
 
-      - name: Create YouTube cookies file
-        env:
-          YOUTUBE_COOKIES_SECRET: ${{ secrets.YOUTUBE_COOKIES }}
-        if: env.YOUTUBE_COOKIES_SECRET != ''
-        run: echo "$YOUTUBE_COOKIES_SECRET" > cookies.txt
+# =========================================================
+# OPTIONAL YOUTUBE COOKIES
+# =========================================================
 
-# -----------------------------------------------------------------------------
-# --- VENV CACHE (VERSION-AWARE) ---
-# -----------------------------------------------------------------------------
+    
+# =========================================================
+# VENV CACHE
+# =========================================================
 
       - name: Restore Venv Cache
         id: restore-venv
-        uses: actions/cache@v3
+        uses: actions/cache/restore@v3
         with:
           path: .venv
           key: ${{ runner.os }}-venv-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('requirements.txt') }}
@@ -92,18 +94,17 @@ jobs:
 
       - name: Setup Dependencies
         run: |
-          # rm -rf .venv
           python -m venv .venv
-          source .venv/bin/activate
           echo ".venv/bin" >> $GITHUB_PATH
+          source .venv/bin/activate
           python -m pip install --upgrade pip
           if [ "${{ steps.restore-venv.outputs.cache-hit }}" != "true" ]; then
             pip install -r requirements.txt
           fi
 
-# -----------------------------------------------------------------------------
-# --- EXECUTION: DOWNLOAD ---
-# -----------------------------------------------------------------------------
+# =========================================================
+# DOWNLOAD
+# =========================================================
 
       - name: Run Downloader Script
         run: python main.py
@@ -122,11 +123,10 @@ jobs:
           else
             echo "file_name=unknown" >> $GITHUB_OUTPUT
           fi
-        shell: bash
 
-# -----------------------------------------------------------------------------
-# --- UPLOAD SECTION ---
-# -----------------------------------------------------------------------------
+# =========================================================
+# UPLOAD SECTION
+# =========================================================
 
       - name: Upload to Telegram
         if: env.PAYLOAD_MODE == 'telegram'
@@ -144,18 +144,19 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ env.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ env.GOOGLE_CLIENT_SECRET }}
 
-# -----------------------------------------------------------------------------
-# --- SAVE CACHE & CLEANUP ---
-# -----------------------------------------------------------------------------
+# =========================================================
+# SAVE CACHE + CLEANUP (ALWAYS)
+# =========================================================
 
       - name: Save Venv Cache (Always)
-        uses: actions/cache/save@v3
         if: always() && steps.restore-venv.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v3
         with:
           path: .venv
           key: ${{ runner.os }}-venv-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('requirements.txt') }}
 
-      - name: Clean up apt cache
+      - name: Clean APT leftover
+        if: always()
         run: |
           sudo rm -rf /var/cache/apt/archives/partial
           sudo rm -rf /var/lib/apt/lists/partial
