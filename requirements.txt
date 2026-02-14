@@ -12,4 +12,4 @@ oauth2client
 httplib2==0.15.0
 webdriver-manager
 playwright
-playwright_stealth
+playwright-stealth
