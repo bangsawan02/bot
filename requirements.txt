@@ -2,7 +2,7 @@ pyrogram
 TgCrypto
 python-dotenv
 requests
-undetected-chromedriver
+asyncio
 setuptools-scm
 selenium-stealth
 yt-dlp
