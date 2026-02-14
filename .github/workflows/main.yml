@@ -9,40 +9,45 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      
-    # --- ENV Global Mengambil Data Langsung dari GAS ---
+
     env:
       PAYLOAD_URL: ${{ github.event.client_payload.url }}
       PAYLOAD_SENDER: ${{ github.event.client_payload.sender }}
       PAYLOAD_MODE: ${{ github.event.client_payload.mode }}
-      
-      # Token Dinamis dari GAS
+
       BOT_TOKEN: ${{ github.event.client_payload.bot_token }}
       GOOGLE_CLIENT_ID: ${{ github.event.client_payload.client_id }}
       GOOGLE_CLIENT_SECRET: ${{ github.event.client_payload.client_secret }}
       DRIVE_REFRESH_TOKEN: ${{ github.event.client_payload.refresh_token }}
-      
-      # Data statis yang masih butuh dari GitHub Vars (Opsional)
+
       API_ID: ${{ vars.API_ID }}
       API_HASH: ${{ vars.API_HASH }}
 
     steps:
       - uses: actions/checkout@v4
 
-      #- name: Set up Python 3.9
-      #  uses: actions/setup-python@v5
-      #  with:
-      #      python-version: '3.9'
+# -----------------------------------------------------------------------------
+# --- PYTHON SETUP (FIXED VERSION + PIP CACHE) ---
+# -----------------------------------------------------------------------------
+
+      - name: Set up Python
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Check Python version
+        run: python --version
 
 # -----------------------------------------------------------------------------
-# --- SETUP DEPENDENCIES & CACHING ---
+# --- APT & MEGATOOLS (CONDITIONAL) ---
 # -----------------------------------------------------------------------------
-      
+
       - name: Grant permissions to APT cache
         run: |
           sudo chown -R $USER:$USER /var/cache/apt
           sudo chown -R $USER:$USER /var/lib/apt
-          # Pastikan file ini ada di repo kamu
           if [ -f "man-db-fast.sh" ]; then chmod +x man-db-fast.sh && sh man-db-fast.sh; fi
 
       - name: Cache APT packages
@@ -60,32 +65,43 @@ jobs:
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y megatools
-          
+
+# -----------------------------------------------------------------------------
+# --- OPTIONAL YOUTUBE COOKIES ---
+# -----------------------------------------------------------------------------
+
       - name: Create YouTube cookies file
         env:
           YOUTUBE_COOKIES_SECRET: ${{ secrets.YOUTUBE_COOKIES }}
         if: env.YOUTUBE_COOKIES_SECRET != ''
         run: echo "$YOUTUBE_COOKIES_SECRET" > cookies.txt
 
+# -----------------------------------------------------------------------------
+# --- VENV CACHE (VERSION-AWARE) ---
+# -----------------------------------------------------------------------------
+
       - name: Restore Venv Cache
         id: restore-venv
         uses: actions/cache@v3
         with:
           path: .venv
-          key: ${{ runner.os }}-venv-${{ hashFiles('requirements.txt') }}
-          restore-keys: ${{ runner.os }}-venv-
+          key: ${{ runner.os }}-venv-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-venv-${{ steps.setup-python.outputs.python-version }}-
+            ${{ runner.os }}-venv-
 
       - name: Setup Dependencies
         run: |
           python -m venv .venv
           source .venv/bin/activate
           echo ".venv/bin" >> $GITHUB_PATH
+          python -m pip install --upgrade pip
           if [ "${{ steps.restore-venv.outputs.cache-hit }}" != "true" ]; then
             pip install -r requirements.txt
           fi
 
 # -----------------------------------------------------------------------------
-# --- EXECUTION: DOWNLOAD & UPLOAD ---
+# --- EXECUTION: DOWNLOAD ---
 # -----------------------------------------------------------------------------
 
       - name: Run Downloader Script
@@ -95,7 +111,7 @@ jobs:
           MEDIAFIRE_PAGE_URL: ${{ env.PAYLOAD_URL }}
           DRIVE_REFRESH_TOKEN: ${{ env.DRIVE_REFRESH_TOKEN }}
           BOT_TOKEN: ${{ env.BOT_TOKEN }}
-          
+
       - name: Get Downloaded Filename
         id: get_filename
         run: |
@@ -107,24 +123,28 @@ jobs:
           fi
         shell: bash
 
-      - name : Upload to Telegram
+# -----------------------------------------------------------------------------
+# --- UPLOAD SECTION ---
+# -----------------------------------------------------------------------------
+
+      - name: Upload to Telegram
         if: env.PAYLOAD_MODE == 'telegram'
         run: python telegram_upload.py
         env:
           OWNER_ID: ${{ env.PAYLOAD_SENDER }}
           BOT_TOKEN: ${{ env.BOT_TOKEN }}
-          
-      - name : Upload to Google Drive
+
+      - name: Upload to Google Drive
         if: env.PAYLOAD_MODE == 'gdrive'
         run: python upload.py
         env:
-          DRIVE_REFRESH_TOKEN: ${{ env.DRIVE_REFRESH_TOKEN }} 
+          DRIVE_REFRESH_TOKEN: ${{ env.DRIVE_REFRESH_TOKEN }}
           FILENAME: ${{ steps.get_filename.outputs.file_name }}
           GOOGLE_CLIENT_ID: ${{ env.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ env.GOOGLE_CLIENT_SECRET }}
 
 # -----------------------------------------------------------------------------
-# --- CLEANUP & FORCE SAVE CACHE ---
+# --- SAVE CACHE & CLEANUP ---
 # -----------------------------------------------------------------------------
 
       - name: Save Venv Cache (Always)
@@ -132,7 +152,7 @@ jobs:
         if: always() && steps.restore-venv.outputs.cache-hit != 'true'
         with:
           path: .venv
-          key: ${{ runner.os }}-venv-${{ hashFiles('requirements.txt') }}
+          key: ${{ runner.os }}-venv-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('requirements.txt') }}
 
       - name: Clean up apt cache
         run: |
