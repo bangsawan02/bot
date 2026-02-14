@@ -6,7 +6,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium_stealth import stealth
 import time
@@ -15,7 +14,7 @@ import re
 import tempfile
 import shutil
 import math
-from urllib.parse import urlparse, urlunparse, urlencode, parse_qs
+from urllib.parse import urlparse
 
 class DownloaderBot:
     def __init__(self, url):
@@ -25,9 +24,9 @@ class DownloaderBot:
         self.temp_download_dir = tempfile.mkdtemp()
         self.initial_message_id = None
         self.driver = None
-        
+
     def close(self):
-        """Cleanup eksplisit untuk menghindari zombie processes."""
+        """Cleanup total: Driver mati, folder temp hilang."""
         if self.driver:
             try:
                 self.driver.quit()
@@ -37,221 +36,194 @@ class DownloaderBot:
             shutil.rmtree(self.temp_download_dir, ignore_errors=True)
 
     # =========================================================
-    # --- 1. TELEGRAM & SIZE HELPERS ---
+    # --- HELPERS (Telegram, Size, Info) ---
     # =========================================================
 
-    def _human_readable_size(self, size_bytes):
-        if not size_bytes: return "0B"
-        size_name = ("B", "KB", "MB", "GB", "TB")
-        i = int(math.floor(math.log(size_bytes, 1024))) if size_bytes > 0 else 0
-        p = math.pow(1024, i)
-        s = round(size_bytes / p, 2)
-        return f"{s} {size_name[i]}"
-
-    def _send_telegram_message(self, message_text):
-        if not self.bot_token or not self.owner_id: return None
-        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        payload = {"chat_id": self.owner_id, "text": message_text, "parse_mode": "Markdown"}
+    def _send_telegram(self, text):
+        if not self.bot_token or not self.owner_id: return
+        url = f"https://api.telegram.org/bot{self.bot_token}/{'editMessageText' if self.initial_message_id else 'sendMessage'}"
+        payload = {"chat_id": self.owner_id, "text": text, "parse_mode": "Markdown"}
+        if self.initial_message_id: payload["message_id"] = self.initial_message_id
         try:
-            response = requests.post(url, json=payload, timeout=10).json()
-            self.initial_message_id = response.get('result', {}).get('message_id')
-            return self.initial_message_id
-        except: return None
+            res = requests.post(url, json=payload, timeout=10).json()
+            if not self.initial_message_id: self.initial_message_id = res.get('result', {}).get('message_id')
+        except: pass
+
+    def _get_file_info(self, url):
+        """Pengecekan link sakti: HEAD dengan fallback GET Stream."""
+        try:
+            # Spoof User-Agent biar gak kena 403
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
+            r = requests.head(url, allow_redirects=True, timeout=10, headers=headers)
+            if r.status_code >= 400:
+                r = requests.get(url, stream=True, timeout=10, headers=headers)
             
-    def _edit_telegram_message(self, message_text):
-        if not self.initial_message_id: return
-        url = f"https://api.telegram.org/bot{self.bot_token}/editMessageText"
-        payload = {"chat_id": self.owner_id, "message_id": self.initial_message_id, 
-                   "text": message_text, "parse_mode": "Markdown"}
-        try: requests.post(url, json=payload, timeout=10)
-        except: pass 
+            ctype = r.headers.get('Content-Type', '').lower()
+            # Jika bukan HTML, berarti kemungkinan besar ini file
+            is_file = 'text/html' not in ctype or any(ext in url.lower() for ext in ['.zip', '.rar', '.7z', '.apk', '.bin'])
+            size = int(r.headers.get('Content-Length', 0))
+            return is_file, size
+        except: return False, 0
 
     # =========================================================
-    # --- 2. CORE DOWNLOADER (ARIA2C & MEGA) ---
+    # --- CORE DOWNLOADERS (Aria2c & Mega) ---
     # =========================================================
 
-    def _download_file_with_aria2c(self, urls, output_filename):
-        self._edit_telegram_message(f"⬇️ **Aria2c:** Memulai download `{output_filename}`...")
+    def _download_aria2c(self, urls, filename):
+        self._send_telegram(f"⚡ **Aria2c:** Memulai unduhan `{filename}`...")
         
-        command = ['aria2c', '--allow-overwrite', '--file-allocation=none', '-x', '16', '-s', '16', '-c', 
-                   '--async-dns=false', '--console-log-level=warn', '-o', output_filename]
+        # Output path di folder saat ini agar mudah diakses caller script
+        cmd = ['aria2c', '--allow-overwrite', '--file-allocation=none', '-x', '16', '-s', '16', '-c', '-o', filename]
         
-        # Cari total size untuk progress bar
-        total_size = None
-        for u in urls:
-            total_size = self._get_file_info(u)[1]
-            if total_size: break
-
-        process = subprocess.Popen(command + urls, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        # Ambil total size buat progress
+        _, total_size = self._get_file_info(urls[0])
+        
+        process = subprocess.Popen(cmd + urls, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         
         last_size = 0
-        last_update_time = time.time()
-        start_time = time.time()
-
+        last_time = time.time()
+        
         try:
             while process.poll() is None:
-                if os.path.exists(output_filename):
-                    current_size = os.path.getsize(output_filename)
-                    
-                    # Stall Detection: Jika size tidak nambah dalam 60 detik, kill.
-                    if current_size > last_size:
-                        last_size = current_size
-                        last_update_time = time.time()
-                    elif time.time() - last_update_time > 60:
+                if os.path.exists(filename):
+                    curr_size = os.path.getsize(filename)
+                    # Stall Detection: Jika macet > 45 detik, bunuh.
+                    if curr_size > last_size:
+                        last_size = curr_size
+                        last_time = time.time()
+                    elif time.time() - last_time > 45:
                         process.kill()
-                        raise Exception("Download macet (Stalled) lebih dari 60 detik.")
-
-                    # Progress update (per 10% atau tiap 5 detik)
-                    if total_size:
-                        percent = int(current_size * 100 // total_size)
-                        if percent % 10 == 0:
-                            self._edit_telegram_message(f"⬇️ **Downloading:** `{percent}%` ({self._human_readable_size(current_size)})")
-                
+                        raise Exception("Download Stall: Kecepatan 0 selama 45 detik.")
+                    
+                    if total_size > 0:
+                        p = int(curr_size * 100 // total_size)
+                        if p % 20 == 0: # Update tiap kelipatan 20% biar gak spam
+                            self._send_telegram(f"📥 **Progress:** `{p}%` | `{filename}`")
                 time.sleep(5)
-
+            
             if process.returncode == 0:
-                self._edit_telegram_message(f"✅ **Download Selesai:** `{output_filename}`")
-                return output_filename
+                return filename
         except Exception as e:
             process.kill()
             raise e
         return None
 
-    def _download_file_with_megatools(self, url):
-        self._edit_telegram_message("⬇️ **Mega.nz:** Menggunakan `megatools`...")
+    def _download_mega(self, url):
+        self._send_telegram("☁️ **Mega.nz:** Menggunakan `megatools`...")
         try:
-            # Megatools langsung download ke working directory
-            process = subprocess.run(['megatools', 'dl', url], capture_output=True, text=True)
-            if process.returncode == 0:
-                # Cari file terbaru yang baru didownload
-                files = sorted([f for f in os.listdir('.') if os.path.isfile(f)], key=os.path.getmtime)
-                return files[-1]
-        except Exception as e:
-            raise Exception(f"Megatools error: {str(e)}")
+            # Download langsung ke current dir
+            subprocess.run(['megatools', 'dl', url], check=True)
+            # Megatools gak kasih output nama file yang mudah, kita cari file terbaru
+            files = sorted([f for f in os.listdir('.') if os.path.isfile(f)], key=os.path.getmtime)
+            return files[-1]
+        except: raise Exception("Gagal mengunduh dari Mega.nz")
 
     # =========================================================
-    # --- 3. SMART CLICKER & SCRAPING ENGINE ---
+    # --- THE BRUTEFORCE ENGINE (CDP + Smart Clicker) ---
     # =========================================================
 
-    def _get_file_info(self, url):
-        """Revisi: Fallback GET jika HEAD gagal."""
-        try:
-            r = requests.head(url, allow_redirects=True, timeout=10)
-            if r.status_code >= 400:
-                r = requests.get(url, stream=True, timeout=10)
-            
-            ctype = r.headers.get('Content-Type', '').lower()
-            is_file = 'text/html' not in ctype
-            size = int(r.headers.get('Content-Length', 0))
-            return is_file, size
-        except: return False, 0
-
-    def _handle_countdown(self, timeout=60):
-        """Revisi: Loop murni sampai elemen timer hilang."""
+    def _handle_countdown(self):
+        """Menunggu timer hilang secara dinamis."""
         start = time.time()
-        while time.time() - start < timeout:
+        while time.time() - start < 60:
             src = self.driver.page_source.lower()
-            match = re.search(r'(\d+)\s*(seconds?|detik|sec|wait)', src)
-            if match:
-                self._edit_telegram_message(f"⏳ **Timer Detected:** Menunggu {match.group(1)}s...")
-                time.sleep(3)
+            if any(x in src for x in ['wait', 'seconds', 'detik', 'readying']):
+                time.sleep(2)
                 continue
             break
-        return True
 
-    def smart_clicker(self, current_url, depth=0):
-        if depth > 3: raise Exception("Deep Scraping Limit Reached.")
-        
-        self._edit_telegram_message(f"🔍 **Scanning Page** (Depth {depth})...")
-        self.driver.get(current_url)
+    def smart_bruteforce(self, url):
+        self._send_telegram("🕵️ **Bruteforce Mode:** Mengendus Network Log...")
+        self.driver.get(url)
         self._handle_countdown()
-        
-        # Strategi 1: Cari link dengan ekstensi file langsung
-        links = self.driver.find_elements(By.TAG_NAME, "a")
-        for l in links:
-            href = l.get_attribute("href")
-            if href and any(ext in href.lower() for ext in ['.zip', '.rar', '.7z', '.apk', '.exe', '.mkv']):
-                is_file, _ = self._get_file_info(href)
-                if is_file: return self._download_file_with_aria2c([href], os.path.basename(urlparse(href).path))
 
-        # Strategi 2: Bruteforce Click tombol "Download"
+        # List selector tombol download paling umum
         selectors = [
             "//a[contains(translate(text(),'D','d'),'ownload')]",
             "//button[contains(translate(text(),'D','d'),'ownload')]",
-            "//div[contains(@id,'download')]//a",
-            "//a[contains(@class,'btn-download')]"
+            "//a[contains(@href,'download')]",
+            "//*[contains(@class,'btn') and contains(@class,'download')]"
         ]
+
+        # Ambil semua element yang cocok
+        elements = self.driver.find_elements(By.XPATH, " | ".join(selectors))
         
-        for xpath in selectors:
+        for el in elements:
             try:
-                btn = self.driver.find_element(By.XPATH, xpath)
-                if btn.is_displayed():
-                    target_url = btn.get_attribute("href")
-                    self.driver.execute_script("arguments[0].click();", btn)
-                    time.sleep(5)
-                    
-                    new_url = self.driver.current_url
-                    if new_url != current_url:
-                        is_file, _ = self._get_file_info(new_url if target_url is None else target_url)
-                        if is_file:
-                            return self._download_file_with_aria2c([new_url], "downloaded_file")
-                        else:
-                            return self.smart_clicker(new_url, depth + 1)
+                if not el.is_displayed(): continue
+                
+                # Klik via JS (Bypass overlay iklan)
+                self.driver.execute_script("arguments[0].click();", el)
+                time.sleep(4) # Tunggu trigger network
+
+                # Bongkar Performance Log buat cari link direct
+                logs = self.driver.get_log('performance')
+                for entry in logs:
+                    msg = json.loads(entry['message'])['message']
+                    if msg['method'] == 'Network.requestWillBeSent':
+                        req_url = msg['params']['request']['url']
+                        
+                        # Filter link yang mencurigakan sebagai file
+                        if any(ext in req_url.lower() for ext in ['.zip', '.rar', '.7z', '.apk', '.bin', '.mkv', '.mp4']):
+                            is_file, _ = self._get_file_info(req_url)
+                            if is_file:
+                                fname = os.path.basename(urlparse(req_url).path) or "downloaded_file"
+                                return self._download_aria2c([req_url], fname)
             except: continue
-            
-        raise Exception("Smart Clicker gagal menemukan endpoint.")
+        
+        raise Exception("Bruteforce gagal: Tidak ditemukan link file di network layer.")
 
     # =========================================================
-    # --- 4. SPECIAL HANDLERS ---
+    # --- HANDLER: SOURCEFORGE ---
     # =========================================================
 
     def _process_sourceforge(self):
-        self.driver.get(self.url)
-        # Ambil mirror list via URL manipulasi
+        self._send_telegram("🌀 **SourceForge:** Mencari Mirror tercepat...")
         p = urlparse(self.url)
-        parts = p.path.split('/')
-        proj, fpath = parts[2], '/'.join(parts[4:-1])
-        mirror_url = f"https://sourceforge.net/settings/mirror_choices?projectname={proj}&filename={fpath}"
+        path_parts = p.path.split('/')
+        # Contoh: /projects/rextls/files/v1.zip/download -> proj: rextls, file: v1.zip
+        proj = path_parts[2]
+        f_name = path_parts[-2] if 'download' in path_parts[-1] else path_parts[-1]
         
+        # Build URL mirror choices
+        mirror_url = f"https://sourceforge.net/settings/mirror_choices?projectname={proj}&filename={f_name}"
         self.driver.get(mirror_url)
-        mirrors = WebDriverWait(self.driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "ul#mirrorList li")))
         
-        ids = [m.get_attribute("id") for m in mirrors if m.get_attribute("id")]
-        # Generate direct links dari mirror IDs
-        direct_links = [f"{self.url}?use_mirror={mid}" for mid in ids[:5]] # Ambil 5 mirror teratas
-        return self._download_file_with_aria2c(direct_links, parts[-1])
+        mirrors = WebDriverWait(self.driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "ul#mirrorList li")))
+        # Ambil 3 mirror pertama untuk download paralel di aria2c
+        m_ids = [m.get_attribute("id") for m in mirrors if m.get_attribute("id")][:3]
+        direct_urls = [f"{self.url}?use_mirror={mid}" for mid in m_ids]
+        
+        return self._download_aria2c(direct_urls, f_name)
 
     # =========================================================
-    # --- 5. ORCHESTRATOR ---
+    # --- MAIN RUNNER ---
     # =========================================================
 
     def run(self):
-        self._send_telegram_message(f"🚀 **Job Started**\nURL: `{self.url}`")
         try:
             if "mega.nz" in self.url:
-                return self._download_file_with_megatools(self.url)
-            
-            # Setup Selenium
-            options = webdriver.ChromeOptions()
-            options.add_argument('--headless=new')
-            options.add_argument('--no-sandbox')
-            options.add_argument('--disable-dev-shm-usage')
-            options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
-            
-            self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+                return self._download_mega(self.url)
+
+            # Setup Chrome dengan Performance Logging diaktifkan
+            opts = webdriver.ChromeOptions()
+            opts.add_argument('--headless=new')
+            opts.add_argument('--no-sandbox')
+            opts.add_argument('--disable-dev-shm-usage')
+            opts.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+            # Paksa download tidak memunculkan popup
+            opts.add_experimental_option("prefs", {"download.prompt_for_download": False})
+
+            self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
             stealth(self.driver, languages=["en-US", "en"], vendor="Google Inc.", platform="Win32", fix_hairline=True)
 
             if "sourceforge.net" in self.url:
                 return self._process_sourceforge()
             else:
-                return self.smart_clicker(self.url)
+                return self.smart_bruteforce(self.url)
 
         except Exception as e:
-            self._edit_telegram_message(f"❌ **Error:**\n`{str(e)[:200]}`")
+            self._send_telegram(f"❌ **Error:** `{str(e)}`")
             return None
         finally:
             self.close()
-
-# Usage
-# bot = DownloaderBot("https://example.com/file")
-# bot.run()
