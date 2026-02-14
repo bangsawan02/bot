@@ -1,151 +1,138 @@
+import asyncio
 import os
+import re
+import shutil
 import subprocess
 import requests
-import time
-import re
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from urllib.parse import urljoin, urlparse
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
-class DownloaderBot:
+class DownloaderBotAsync:
     def __init__(self, url):
         self.url = url
-        self.bot_token = os.environ.get("BOT_TOKEN")
-        self.owner_id = os.environ.get("PAYLOAD_SENDER")
-        self.initial_message_id = None
 
-    # =========================================================
-    # --- HELPERS ---
-    # =========================================================
+    # -----------------------------
+    # Helpers
+    # -----------------------------
+    def _tool(self, name):
+        return shutil.which(name) is not None
 
-    def _send_telegram(self, text):
-        if not self.bot_token or not self.owner_id: return
-        mode = "editMessageText" if self.initial_message_id else "sendMessage"
-        api_url = f"https://api.telegram.org/bot{self.bot_token}/{mode}"
-        payload = {"chat_id": self.owner_id, "text": text, "parse_mode": "Markdown"}
-        if self.initial_message_id: payload["message_id"] = self.initial_message_id
-        
+    async def _download_requests(self, url, name):
         try:
-            res = requests.post(api_url, json=payload, timeout=10).json()
-            if not self.initial_message_id:
-                self.initial_message_id = res.get('result', {}).get('message_id')
-        except: pass
-
-    # =========================================================
-    # --- CORE ENGINES ---
-    # =========================================================
-
-    def _download_aria2c(self, urls, filename):
-        """Dipakai khusus untuk SourceForge & Direct Links karena lebih kencang."""
-        self._send_telegram(f"⚡ **Aria2c:** Mengunduh `{filename}` via multi-connection...")
-        cmd = ['aria2c', '--allow-overwrite', '-x', '16', '-s', '16', '-c', '-o', filename]
-        process = subprocess.run(cmd + urls, capture_output=True, text=True)
-        return filename if process.returncode == 0 else None
-
-    def _download_mega(self, url):
-        """Wrapper Megatools tetap yang terbaik buat Mega."""
-        self._send_telegram("☁️ **Mega.nz:** Menggunakan `megatools`...")
-        try:
-            subprocess.run(['megatools', 'dl', url], check=True)
-            files = sorted([f for f in os.listdir('.') if os.path.isfile(f)], key=os.path.getmtime)
-            return files[-1]
-        except: return None
-
-    # =========================================================
-    # --- PLAYWRIGHT HANDLERS ---
-    # =========================================================
-
-    def _process_sourceforge(self, page):
-        """Ambil mirror SourceForge dan lempar ke Aria2c."""
-        self._send_telegram("🌀 **SourceForge:** Mencari mirror...")
-        page.goto(self.url)
-        
-        # Manipulasi URL untuk dapet list mirror
-        proj_match = re.search(r'/projects/([^/]+)/files/(.*?)(/download|$)', self.url)
-        if proj_match:
-            proj, fpath = proj_match.group(1), proj_match.group(2)
-            mirror_url = f"https://sourceforge.net/settings/mirror_choices?projectname={proj}&filename={fpath}"
-            page.goto(mirror_url)
-            
-            # Ambil 3 ID mirror pertama
-            mirrors = page.locator("ul#mirrorList li").all()
-            ids = [m.get_attribute("id") for m in mirrors if m.get_attribute("id")][:3]
-            direct_urls = [f"{self.url}?use_mirror={mid}" for mid in ids]
-            return self._download_aria2c(direct_urls, fpath.split('/')[-1])
-        return None
-
-    def _process_generic(self, page):
-        """Bruteforce Klik & Tangkap Download Event (Solusi Apkadmin, dkk)."""
-        self._send_telegram("🕵️ **Bruteforce:** Menunggu event download...")
-        
-        try:
-            page.goto(self.url, wait_until="domcontentloaded")
-            
-            # 1. Tunggu timer/countdown (jika ada)
-            page.wait_for_timeout(5000) 
-
-            # 2. Setup Download Listener
-            # Kita 'mendengarkan' browser. Begitu ada stream file masuk, kita tangkap.
-            with page.expect_download(timeout=120000) as download_info:
-                
-                # List selector tombol yang mungkin memicu download
-                selectors = [
-                    "text=/.*[Dd]ownload.*/", 
-                    "#downloadbtn", 
-                    ".downloadbtn",
-                    "button:has-text('Start')",
-                    "a[href*='download']"
-                ]
-                
-                # Coba klik satu per satu sampai trigger download muncul
-                for selector in selectors:
-                    try:
-                        btn = page.locator(selector).first
-                        if btn.is_visible():
-                            btn.click(no_wait_after=True) # Jangan tunggu navigasi, tunggu download
-                    except: continue
-
-                download = download_info.value
-                filename = download.suggested_filename
-                
-                self._send_telegram(f"📥 **Streaming:** `{filename}` sedang ditarik...")
-                
-                final_path = os.path.join(os.getcwd(), filename)
-                download.save_as(final_path)
-                return filename
-
-        except PlaywrightTimeout:
-            raise Exception("Timeout: Browser tidak mendeteksi adanya file yang dikirim server.")
+            r = requests.get(url, stream=True, timeout=20)
+            r.raise_for_status()
+            with open(name, "wb") as f:
+                for c in r.iter_content(8192):
+                    if c: f.write(c)
+            return name
         except Exception as e:
-            raise e
+            print("requests fail:", e)
+            return None
 
-    # =========================================================
-    # --- ORCHESTRATOR ---
-    # =========================================================
-
-    def run(self):
-        # Jalur cepat tanpa browser
-        if "mega.nz" in self.url:
-            return self._download_mega(self.url)
-
-        with sync_playwright() as p:
-            # Launch dengan user-agent asli agar tidak terdeteksi bot
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-            )
-            page = context.new_page()
-
+    async def _download_with_fallback(self, url, name):
+        if self._tool("aria2c"):
             try:
-                if "sourceforge.net" in self.url:
-                    result = self._process_sourceforge(page)
-                else:
-                    result = self._process_generic(page)
-                
-                if result:
-                    self._send_telegram(f"✅ **Selesai:** `{result}`")
-                return result
-
+                res = subprocess.run(
+                    ["aria2c", "-x", "16", "-s", "16", "-c", "-o", name, url],
+                    capture_output=True, text=True
+                )
+                if res.returncode == 0:
+                    return name
             except Exception as e:
-                self._send_telegram(f"❌ **Error:** `{str(e)}`")
-                return None
+                print("aria2c fail:", e)
+        return await self._download_requests(url, name)
+
+    def _head_is_file(self, url):
+        try:
+            h = requests.head(url, allow_redirects=True, timeout=6)
+            ctype = (h.headers.get("content-type") or "").lower()
+            cd = h.headers.get("content-disposition", "")
+            if cd or any(x in ctype for x in ("application/", "octet-stream", "zip", "apk")):
+                return True, cd
+        except Exception as e:
+            print("HEAD fail:", e)
+        return False, None
+
+    async def _extract_filename(self, cd, url):
+        if cd:
+            m = re.search(r'filename="?([^";]+)"?', cd)
+            if m: return m.group(1)
+        return os.path.basename(urlparse(url).path) or "downloaded_file"
+
+    # -----------------------------
+    # Bruteforce Async
+    # -----------------------------
+    async def _bruteforce(self, page):
+        sniffed = []
+
+        async def on_resp(resp):
+            try:
+                headers = resp.headers
+                ctype = headers.get("content-type", "").lower()
+                cd = headers.get("content-disposition", "").lower()
+                if "application/" in ctype or "octet-stream" in ctype or "attachment" in cd:
+                    sniffed.append(resp.url)
+            except: pass
+
+        page.on("response", on_resp)
+        await page.goto(self.url, wait_until="domcontentloaded")
+
+        # scrape anchors
+        for a in await page.locator("a").all():
+            href = await a.get_attribute("href")
+            if href:
+                full_url = urljoin(self.url, href)
+                if any(ext in full_url.lower() for ext in ['.apk','.zip','.rar','.exe','.7z']):
+                    ok, cd = await asyncio.to_thread(self._head_is_file, full_url)
+                    if ok:
+                        name = await self._extract_filename(cd, full_url)
+                        return await self._download_with_fallback(full_url, name)
+
+        # bruteforce click + expect_download
+        selectors = ["text=/.*[Dd]ownload.*/", ".downloadbtn", "#downloadbtn", "text='Start Download'"]
+        try:
+            async with page.expect_download(timeout=15000) as dl_info:
+                for sel in selectors:
+                    btn = page.locator(sel).first
+                    if await btn.is_visible():
+                        await btn.click(no_wait_after=True)
+                        await page.wait_for_timeout(2000)
+                        if sniffed:
+                            target = sniffed[-1]
+                            ok, cd = await asyncio.to_thread(self._head_is_file, target)
+                            if ok:
+                                name = await self._extract_filename(cd, target)
+                                return await self._download_with_fallback(target, name)
+
+            download = await dl_info.value
+            fname = download.suggested_filename
+            await download.save_as(fname)
+            return fname
+        except PlaywrightTimeout:
+            raise Exception("Bruteforce gagal: tidak ada download event.")
+
+    # -----------------------------
+    # Orchestrator (auto headless→headful)
+    # -----------------------------
+    async def _run_session(self, headless):
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=headless)
+            ctx = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            page = await ctx.new_page()
+            try:
+                return await self._bruteforce(page)
             finally:
-                browser.close()
+                await browser.close()
+
+    async def run(self):
+        # coba headless dulu
+        try:
+            return await self._run_session(headless=True)
+        except Exception as e:
+            print("Headless gagal, switching to headful:", e)
+        # fallback ke headful
+        return await self._run_session(headless=False)
+
+
+# --- Cara pakai ---
+# asyncio.run(DownloaderBotAsync("https://apkadmin.com/...").run())
