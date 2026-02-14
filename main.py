@@ -1,37 +1,39 @@
 import os
 import sys
+import asyncio
 
-# ✅ Import hanya Class DownloaderBot dari file utils
-from utils import DownloaderBot
+# Import class sesuai yang kamu pakai (DownloaderBot atau DownloaderBotAsync)
+from utils import DownloaderBotAsync  # ganti ke DownloaderBot kalau bukan async
 
-# Dapatkan URL dari environment variable
-url_to_download = os.environ.get("MEDIAFIRE_PAGE_URL")
+def main():
+    url_to_download = os.environ.get("MEDIAFIRE_PAGE_URL")
+
+    if not url_to_download:
+        print("❌ Error: MEDIAFIRE_PAGE_URL environment variable not set.")
+        sys.exit(1)
+
+    print(f"Memulai proses download untuk URL: {url_to_download}")
+    downloaded_filename = None
+
+    try:
+        # Inisialisasi class
+        downloader = DownloaderBotAsync(url_to_download)
+
+        # Jalankan proses utama (async)
+        downloaded_filename = asyncio.run(downloader.run())
+
+        # Buat file txt kalau berhasil
+        if downloaded_filename:
+            with open("downloaded_filename.txt", "w") as f:
+                f.write(downloaded_filename)
+            print(f"✅ Selesai. Nama file: {downloaded_filename} dicatat di downloaded_filename.txt")
+        else:
+            print("❌ Proses download selesai tanpa menghasilkan file valid.")
+            sys.exit(1)
+
+    except Exception as e:
+        print(f"💥 Error fatal saat eksekusi utama: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    if url_to_download:
-        print(f"Memulai proses download untuk URL: {url_to_download}")
-        downloaded_filename = None
-        
-        try:
-            # 1. Inisialisasi Class
-            downloader = DownloaderBot(url_to_download)
-            
-            # 2. Jalankan Proses Utama dan tangkap nama file yang diunduh
-            downloaded_filename = downloader.run()
-            
-            # 3. Buat downloaded_filename.txt jika berhasil
-            if downloaded_filename:
-                with open("downloaded_filename.txt", "w") as f: 
-                    f.write(downloaded_filename)
-                print(f"✅ Selesai. Nama file: {downloaded_filename} telah dicatat dalam downloaded_filename.txt")
-            else:
-                print("❌ Proses download selesai tanpa menghasilkan file yang valid.")
-                sys.exit(1)
-
-        except Exception as e:
-            # Fatal error di luar logika download
-            print(f"Error fatal saat eksekusi utama: {e}")
-            sys.exit(1)
-    else:
-        print("Error: MEDIAFIRE_PAGE_URL environment variable not set.")
-        sys.exit(1)
+    main()
