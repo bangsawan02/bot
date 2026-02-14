@@ -101,6 +101,7 @@ jobs:
           if [ "${{ steps.restore-venv.outputs.cache-hit }}" != "true" ]; then
             pip install -r requirements.txt
           fi
+          playwright install chromium --with-deps
 
 # =========================================================
 # DOWNLOAD
