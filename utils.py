@@ -1,34 +1,65 @@
 import os
 import re
+import sys
 import asyncio
 import subprocess
 import shutil
 import requests
+import mimetypes
 from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-from playwright_stealth import Stealth
+from playwright_stealth import stealth_async
 
+# -------------------------
+# Utility helpers
+# -------------------------
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r'[^A-Za-z0-9._-]', '_', name)
+    return name[:200] if name else "downloaded_file"
+
+def extract_filename_from_cd(cd: str):
+    if not cd:
+        return None
+    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^\";]+)"?', cd, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return None
+
+def guess_name_from_headers_or_url(headers: dict, url: str, suggested: str = None):
+    cd = headers.get("content-disposition") if headers else None
+    name = extract_filename_from_cd(cd) if cd else None
+    if name:
+        return sanitize_filename(name)
+    if suggested:
+        return sanitize_filename(suggested)
+    path = urlparse(url).path
+    base = os.path.basename(path)
+    if base:
+        return sanitize_filename(base)
+    ctype = (headers.get("content-type") or "").split(";")[0].strip()
+    ext = mimetypes.guess_extension(ctype) or ".bin"
+    return sanitize_filename("downloaded_file" + ext)
+
+# -------------------------
+# DownloaderBotAsync
+# -------------------------
 class DownloaderBotAsync:
-    def __init__(self, url):
+    def __init__(self, url: str):
         self.url = url
         self.bot_token = os.environ.get("BOT_TOKEN")
         self.owner_id = os.environ.get("PAYLOAD_SENDER")
         self.initial_message_id = None
 
-    # =========================================================
-    # --- HELPERS (Telegram & System) ---
-    # =========================================================
-
-    async def _send_telegram(self, text):
+    # Telegram helper (best-effort)
+    async def _send_telegram(self, text: str):
         if not self.bot_token or not self.owner_id:
-            print("Telegram not configured:", text)
+            print("[TELEGRAM NOT CONFIGURED]", text)
             return
         mode = "editMessageText" if self.initial_message_id else "sendMessage"
         api_url = f"https://api.telegram.org/bot{self.bot_token}/{mode}"
         payload = {"chat_id": self.owner_id, "text": text, "parse_mode": "Markdown"}
         if self.initial_message_id:
             payload["message_id"] = self.initial_message_id
-
         try:
             res = await asyncio.to_thread(requests.post, api_url, json=payload, timeout=10)
             data = res.json()
@@ -37,17 +68,9 @@ class DownloaderBotAsync:
         except Exception as e:
             print("Telegram send failed:", e)
 
-    def _extract_filename(self, cd, url):
-        if cd:
-            m = re.search(r'filename="?([^";]+)"?', cd)
-            if m:
-                return m.group(1)
-        path = urlparse(url).path
-        name = os.path.basename(path)
-        return name or "downloaded_file"
-
-    async def _download_aria2(self, url, name):
-        # Try aria2c if available
+    # aria2c or requests fallback
+    async def _download_aria2(self, url: str, name: str):
+        # Try aria2c
         if shutil.which("aria2c"):
             await self._send_telegram(f"⚡ **Aria2c:** Meroketkan `{name}`...")
             cmd = ["aria2c", "-x", "16", "-s", "16", "-c", "-o", name, url]
@@ -57,14 +80,14 @@ class DownloaderBotAsync:
                 return name
             else:
                 print("aria2c failed:", proc.returncode, stderr.decode(errors="ignore"))
+
         # Fallback to requests streaming
         try:
             await self._send_telegram(f"⬇️ **Requests fallback:** Mengunduh `{name}`...")
             with requests.get(url, stream=True, timeout=30) as r:
                 r.raise_for_status()
-                # try to get filename from headers
                 cd = r.headers.get("content-disposition")
-                fname = self._extract_filename(cd, url) or name
+                fname = guess_name_from_headers_or_url(r.headers, r.url, suggested=name)
                 with open(fname, "wb") as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         if chunk:
@@ -75,40 +98,34 @@ class DownloaderBotAsync:
             print("requests download failed:", e)
         return None
 
-    # =========================================================
-    # --- CORE LOGIC (Network Sniffer & Bruteforce) ---
-    # =========================================================
-
+    # Core bruteforce + sniffer
     async def _bruteforce(self, page):
         sniffed = []
         last_response_headers = {}
 
-        # Sniffer: capture file-like responses
         async def on_response(response):
             try:
                 url = response.url
                 headers = {k.lower(): v for k, v in response.headers.items()}
                 ctype = (headers.get("content-type") or "").lower()
                 cd = (headers.get("content-disposition") or "").lower()
-                # store last headers for fallback naming
                 last_response_headers[url] = headers
-                if any(x in ctype for x in ("application/", "octet-stream")) or "attachment" in cd or url.endswith((".apk", ".zip", ".exe", ".msi", ".tar.gz")):
+                if any(x in ctype for x in ("application/", "octet-stream")) or "attachment" in cd or url.lower().endswith((".apk", ".zip", ".exe", ".msi", ".tar.gz", ".apk.html")):
                     if url not in sniffed:
                         sniffed.append(url)
             except Exception:
                 pass
 
         page.on("response", on_response)
+
         await page.goto(self.url, wait_until="domcontentloaded")
         await page.wait_for_timeout(1500)
 
-        # 1. Cek apakah ada timer/countdown di halaman
         content = await page.content()
         if any(x in content.lower() for x in ("wait", "seconds", "readying", "please wait")):
             await self._send_telegram("⏳ **Timer detected:** Menunggu 10 detik...")
             await page.wait_for_timeout(10000)
 
-        # 2. Klik Bruteforce dengan Expect Download
         selectors = [
             "text=/.*[Dd]ownload.*/",
             "button:has-text('Start')",
@@ -122,24 +139,21 @@ class DownloaderBotAsync:
             "a[href$='.apk']"
         ]
 
-        # helper to try multiple click methods
         async def try_click(locator):
             try:
                 await locator.scroll_into_view_if_needed()
-            except: pass
-            # try normal click
+            except:
+                pass
             try:
                 await locator.click(timeout=3000)
                 return True
             except:
                 pass
-            # try JS click
             try:
                 await locator.evaluate("el => el.click()")
                 return True
             except:
                 pass
-            # try dispatch event
             try:
                 await locator.evaluate("""
                     el => {
@@ -152,10 +166,8 @@ class DownloaderBotAsync:
                 pass
             return False
 
-        # Start waiting for download event but also attempt clicks and monitor sniffed
         try:
             async with page.expect_download(timeout=60000) as download_info:
-                # try each selector multiple times
                 for selector in selectors:
                     try:
                         loc = page.locator(selector).first
@@ -168,7 +180,6 @@ class DownloaderBotAsync:
                             await self._send_telegram(f"🔎 Menemukan selector: `{selector}` — mencoba klik...")
                             clicked = await try_click(loc)
                             if clicked:
-                                # give some time for network events
                                 for _ in range(6):
                                     await page.wait_for_timeout(1000)
                                     if sniffed:
@@ -178,15 +189,13 @@ class DownloaderBotAsync:
                     except Exception:
                         continue
 
-                # If no visible selector found, try clicking anchors by scanning all anchors
                 if not sniffed:
                     anchors = await page.query_selector_all("a")
                     for a in anchors:
                         try:
                             href = await a.get_attribute("href")
-                            if href and any(ext in href for ext in [".apk", ".zip", ".exe", ".msi"]):
+                            if href and any(ext in href.lower() for ext in [".apk", ".zip", ".exe", ".msi"]):
                                 await self._send_telegram(f"🔗 Anchor direct link found: `{href}`")
-                                # try to navigate directly to href to trigger download
                                 await page.goto(urljoin(self.url, href), wait_until="domcontentloaded")
                                 await page.wait_for_timeout(2000)
                                 if sniffed:
@@ -201,44 +210,37 @@ class DownloaderBotAsync:
                 return fname
 
         except PlaywrightTimeout:
-            # Debug: report sniffed list periodically
             await self._send_telegram(f"⚠️ Expect download timeout. Sniffed count: {len(sniffed)}")
-            # If sniffed URLs exist, try last one
+            print("Sniffed URLs:", sniffed)
+            for u in sniffed:
+                print(" -", u, last_response_headers.get(u))
             if sniffed:
                 target = sniffed[-1]
                 headers = last_response_headers.get(target, {})
-                cd = headers.get("content-disposition")
-                fname = self._extract_filename(cd, target)
+                fname = guess_name_from_headers_or_url(headers, target)
                 result = await self._download_aria2(target, fname)
                 if result:
                     return result
-                # if aria2 and requests failed, try HEAD to resolve redirect
                 try:
                     head = requests.head(target, allow_redirects=True, timeout=10)
                     cd2 = head.headers.get("content-disposition")
-                    fname2 = self._extract_filename(cd2, head.url)
+                    fname2 = guess_name_from_headers_or_url(head.headers, head.url, suggested=fname)
                     result2 = await self._download_aria2(head.url, fname2)
                     if result2:
                         return result2
-                except Exception:
-                    pass
-            # nothing worked
+                except Exception as e:
+                    print("HEAD fallback failed:", e)
             raise Exception("Bruteforce gagal: tidak ada download event dan fallback gagal.")
 
-    # =========================================================
-    # --- ORCHESTRATOR WITH XVFB ---
-    # =========================================================
-
-    async def _run_with_xvfb(self, headless):
-        """Menjalankan Playwright di dalam virtual display."""
+    # Run with optional Xvfb
+    async def _run_with_xvfb(self, headless: bool):
         xvfb_proc = None
         if not headless:
-            # Jalankan Xvfb secara manual jika di Linux
             display = ":99"
             os.environ["DISPLAY"] = display
             try:
                 xvfb_proc = subprocess.Popen(["Xvfb", display, "-screen", "0", "1280x1024x24"])
-                await asyncio.sleep(2)  # Tunggu Xvfb siap
+                await asyncio.sleep(2)
             except Exception as e:
                 print("Xvfb start failed:", e)
 
@@ -247,21 +249,20 @@ class DownloaderBotAsync:
                 headless=headless,
                 args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
             )
-
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
             )
-
             page = await context.new_page()
-            # Terapkan Stealth agar tidak terdeteksi sebagai bot
+
+            # apply stealth
             try:
-                # playwright_stealth exports stealth function
-                await stealth(page)
+                await stealth_async(page)
             except Exception as e:
+                await self._send_telegram(f"stealth apply failed: {e}")
                 print("stealth apply failed:", e)
 
-            # Matikan popup iklan otomatis
-            page.on("popup", lambda p: asyncio.create_task(p.close()))
+            # close popups safely
+            page.on("popup", lambda popup: asyncio.create_task(popup.close()))
 
             try:
                 result = await self._bruteforce(page)
@@ -280,12 +281,12 @@ class DownloaderBotAsync:
     async def run(self):
         await self._send_telegram(f"🚀 **Job Started:** `{self.url}`")
         try:
-            # Coba headless dulu
             try:
                 return await self._run_with_xvfb(headless=True)
             except Exception as e:
-                await self._send_telegram(f"⚠️ Headless gagal: `{str(e)}`. Mencoba mode Xvfb Virtual...")
+                await self._send_telegram(f"⚠️ Headless failed: `{str(e)}`. Trying Xvfb mode...")
                 return await self._run_with_xvfb(headless=False)
         except Exception as e:
             await self._send_telegram(f"💥 **Error:** `{str(e)}`")
+            print("Final error:", e)
             return None
