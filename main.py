@@ -3,7 +3,7 @@ import sys
 import asyncio
 
 # Import class sesuai yang kamu pakai (DownloaderBot atau DownloaderBotAsync)
-from utils import DownloaderBotAsync  # ganti ke DownloaderBot kalau bukan async
+from utils import DownloaderBot  # ganti ke DownloaderBot kalau bukan async
 
 def main():
     url_to_download = os.environ.get("MEDIAFIRE_PAGE_URL")
