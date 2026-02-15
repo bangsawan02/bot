@@ -2,13 +2,11 @@ import os
 import re
 import sys
 import asyncio
-import tempfile
 import uuid
-import subprocess
 import requests
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-from playwright_stealth import Stealth  # Import class Stealth (pake S gede)
+from playwright_stealth import Stealth
 
 # -------------------------
 # 🛠️ Helpers
@@ -26,7 +24,7 @@ def extract_filename(cd: str, url: str):
     return sanitize_filename(os.path.basename(urlparse(url).path) or "downloaded_file")
 
 # -------------------------
-# 📢 Telegram Sync Helpers
+# 📢 Telegram Helpers
 # -------------------------
 def _tg_send_message(bot_token, chat_id, text):
     try:
@@ -36,51 +34,36 @@ def _tg_send_message(bot_token, chat_id, text):
 
 def _tg_send_document(bot_token, chat_id, file_path, caption):
     try:
+        if not os.path.exists(file_path): return
         with open(file_path, "rb") as f:
             requests.post(f"https://api.telegram.org/bot{bot_token}/sendDocument", 
-                          data={"chat_id": chat_id, "caption": caption}, files={"document": f}, timeout=120)
+                          data={"chat_id": chat_id, "caption": caption}, files={"document": f}, timeout=300)
     except: pass
 
 # -------------------------
 # 🎯 Core: Click and Capture
 # -------------------------
-async def click_and_capture(page, selector, timeout=30000):
-    locator = page.locator(selector).first
-    if not await locator.count():
-        return None
-
-    async def force_click():
-        try:
-            # Pake JS click biar nembus overlay iklan
-            await locator.evaluate("el => el.click()")
-        except:
-            await locator.click(force=True)
-
+async def click_and_capture(page, selector, timeout=60000):
+    """
+    Spesifik untuk Pixeldrain: Menunggu event download setelah klik.
+    """
     try:
-        # Listening download & popup barengan
-        async with page.context.expect_page(timeout=5000) as p_info:
-            async with page.expect_download(timeout=timeout) as d_info:
-                await force_click()
+        # Menyiapkan listener download
+        async with page.expect_download(timeout=timeout) as d_info:
+            # Cari tombol, scroll, dan klik dengan delay human-like
+            button = page.locator(selector).first
+            await button.scroll_into_view_if_needed()
+            await asyncio.sleep(1) 
+            await button.click(force=True)
             
-            download = await d_info.value
-            fname = extract_filename(None, download.suggested_filename)
-            await download.save_as(fname)
-            return fname
-
-    except PlaywrightTimeout:
-        try:
-            # Kalo timeout, tutup popup iklan yang mungkin muncul
-            popup = await p_info.value
-            await popup.close() 
-            # Coba klik lagi sekali
-            async with page.expect_download(timeout=timeout) as d_info_final:
-                await force_click()
-            download = await d_info_final.value
-            fname = extract_filename(None, download.suggested_filename)
-            await download.save_as(fname)
-            return fname
-        except:
-            return None
+        download = await d_info.value
+        # Simpan file
+        fname = sanitize_filename(download.suggested_filename)
+        await download.save_as(fname)
+        return fname
+    except Exception as e:
+        print(f"[!] Gagal capture download: {e}")
+        return None
 
 # -------------------------
 # 🤖 Main Downloader Class
@@ -90,87 +73,61 @@ class DownloaderBot:
         self.url = url
         self.bot_token = os.environ.get("BOT_TOKEN")
         self.chat_id = os.environ.get("PAYLOAD_SENDER")
+        # Selector berdasarkan outerHTML yang lu kasih
         self.selectors = [
-            "#body > div > div.file_preview_row.svelte-jngqwx > div.file_preview.svelte-jngqwx.checkers > div.block.svelte-40do4p > div > button",
-            "text=/.*[Dd]ownload.*/i",
-            "button:has-text('Start')",
-            "a[href$='.apk']"
+            "button.button_highlight",      # Tombol utama di tengah
+            "button.toolbar_button",        # Tombol di sidebar
+            "text='Download'",              # Fallback teks
+            "i:has-text('download') + span" # Target spesifik ke span 'Download'
         ]
 
     async def notify(self, text):
+        print(f"[*] {text}")
         if self.bot_token and self.chat_id:
             await asyncio.to_thread(_tg_send_message, self.bot_token, self.chat_id, text)
 
-    async def send_file(self, path):
-        if self.bot_token and self.chat_id:
-            await asyncio.to_thread(_tg_send_document, self.bot_token, self.chat_id, path, f"✅ Sukses: `{path}`")
-
-    async def _run_logic(self, playwright_instance, headless=True):
-        # Di sini kita pake instance 'p' yang sudah dibungkus Stealth
-        browser = await playwright_instance.chromium.launch(
-            headless=headless, 
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
-        )
-        
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
-        
-        await self.notify(f"🌐 Loading: {self.url}")
-        await page.goto(self.url, wait_until="domcontentloaded")
-        
-        # Bypass timer/protection
-        await asyncio.sleep(8)
-
-        # Cari tombol
-        found_selector = None
-        for sel in self.selectors:
-            try:
-                if await page.locator(sel).first.is_visible():
-                    found_selector = sel
-                    break
-            except: continue
-
-        if not found_selector:
-            await self.notify("❌ Gagal: Tombol download nggak kelihatan.")
-            await browser.close()
-            return None
-
-        await self.notify(f"🎯 Tombol ketemu! Mencoba download...")
-        filename = await click_and_capture(page, found_selector)
-        
-        await browser.close()
-        return filename
-
     async def run(self):
-        # 🟢 INI POLA YANG LU MAU: Global Stealth wrapper
+        # Gunakan wrapper Stealth yang lu minta
         async with Stealth().use_async(async_playwright()) as p:
-            # 1. Coba Headless
+            # Pastikan headless=False agar tidak terdeteksi bot di Pixeldrain
+            browser = await p.chromium.launch(headless=False)
+            context = await browser.new_context(viewport={'width': 1280, 'height': 1024})
+            page = await context.new_page()
+            
+            await self.notify(f"🌐 Membuka URL: {self.url}")
+            
             try:
-                result = await self._run_logic(p, headless=True)
-                if result: return result
-            except Exception as e:
-                print(f"Headless error: {e}")
+                # Navigasi dengan timeout panjang (Pixeldrain kadang agak berat)
+                await page.goto(self.url, wait_until="networkidle", timeout=60000)
+                await asyncio.sleep(5) # Jeda untuk render Svelte
 
-            # 2. Fallback Xvfb (Buat di GitHub Runner/Server)
-            await self.notify("🔄 Headless gagal, pindah ke Virtual Display...")
-            xvfb_proc = None
-            try:
-                os.environ["DISPLAY"] = ":99"
-                xvfb_proc = subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1280x1024x24"])
-                await asyncio.sleep(2)
+                # Cari tombol yang visible
+                target = None
+                for sel in self.selectors:
+                    if await page.locator(sel).first.is_visible():
+                        target = sel
+                        break
+
+                if target:
+                    await self.notify(f"🎯 Klik tombol download...")
+                    file_path = await click_and_capture(page, target)
+                    
+                    if file_path and os.path.exists(file_path):
+                        await self.notify(f"✅ Download Sukses: `{file_path}`")
+                        await asyncio.to_thread(_tg_send_document, self.bot_token, self.chat_id, file_path, f"Selesai: {file_path}")
+                        # Hapus file setelah dikirim agar tidak memenuhi disk
+                        os.remove(file_path)
+                        return file_path
                 
-                result = await self._run_logic(p, headless=False)
-                return result
+                await self.notify("❌ Tombol tidak ditemukan atau download gagal.")
+                
             except Exception as e:
-                await self.notify(f"💥 Error Fatal: {str(e)}")
+                await self.notify(f"💥 Terjadi kesalahan: {str(e)[:100]}")
             finally:
-                if xvfb_proc: xvfb_proc.terminate()
+                await browser.close()
         return None
 
 if __name__ == "__main__":
     if len(sys.argv) < 2: sys.exit(1)
-    url = sys.argv[1]
-    bot = DownloaderBot(url)
+    bot = DownloaderBot(sys.argv[1])
     asyncio.run(bot.run())
