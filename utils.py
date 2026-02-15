@@ -19,7 +19,7 @@ class DownloaderBot:
             "#downloadButton",            # Mediafire / Gofile
             ".downloadbtn",               # ApkAdmin / Generic
             "text='Download'",            # Generic
-            "text='Download Now'",        # Generic
+            "#filemanager_itemslist > div:nth-child(7) > div > div:nth-child(2) > div > button",        # Gofile
             "#download-btn",              # Generic
             "a.btn-primary",              # Generic link
             ".btn-success"                # Generic button
