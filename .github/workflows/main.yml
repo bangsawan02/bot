@@ -109,7 +109,7 @@ jobs:
 # =========================================================
 
       - name: Run Downloader Script
-        run: python main.py
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" python main.py
         env:
           OWNER_ID: ${{ env.PAYLOAD_SENDER }}
           MEDIAFIRE_PAGE_URL: ${{ env.PAYLOAD_URL }}
