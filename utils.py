@@ -221,7 +221,7 @@ class DownloaderBot:
         self.chat_id = os.environ.get("PAYLOAD_SENDER")
         self.max_attempts = max_attempts
         self.selectors = [
-            "text=/.*Click here to download.*/i",
+            "#body > div > div.file_preview_row.svelte-jngqwx > div.file_preview.svelte-jngqwx.checkers > div.block.svelte-40do4p > div > button",
             "a[href$='.apk']",
             "a:has-text('Download')",
             "text=/.*Free Download.*/i",
