@@ -2,8 +2,8 @@ import os
 import sys
 import asyncio
 
-# Import class sesuai yang kamu pakai (DownloaderBot atau DownloaderBotAsync)
-from utils import DownloaderBot  # ganti ke DownloaderBot kalau bukan async
+# Import class sesuai versi terbaru
+from utils import DownloaderBot  # pastikan utils.py mengekspor DownloaderBot
 
 def main():
     url_to_download = os.environ.get("MEDIAFIRE_PAGE_URL")
@@ -16,17 +16,21 @@ def main():
     downloaded_filename = None
 
     try:
-        # Inisialisasi class
-        downloader = DownloaderBotAsync(url_to_download)
+        # Inisialisasi class (DownloaderBot memiliki method async run)
+        downloader = DownloaderBot(url_to_download)
 
         # Jalankan proses utama (async)
         downloaded_filename = asyncio.run(downloader.run())
 
         # Buat file txt kalau berhasil
         if downloaded_filename:
-            with open("downloaded_filename.txt", "w") as f:
-                f.write(downloaded_filename)
-            print(f"✅ Selesai. Nama file: {downloaded_filename} dicatat di downloaded_filename.txt")
+            try:
+                with open("downloaded_filename.txt", "w") as f:
+                    f.write(downloaded_filename)
+                print(f"✅ Selesai. Nama file: {downloaded_filename} dicatat di downloaded_filename.txt")
+            except Exception as e:
+                print(f"⚠️ Download berhasil tapi gagal menulis file: {e}")
+                print(f"✅ Nama file: {downloaded_filename}")
         else:
             print("❌ Proses download selesai tanpa menghasilkan file valid.")
             sys.exit(1)
