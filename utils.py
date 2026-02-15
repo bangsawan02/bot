@@ -2,11 +2,8 @@ import os
 import re
 import sys
 import asyncio
-import subprocess
-import shutil
-import requests
 import mimetypes
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 # -------------------------
@@ -14,11 +11,9 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 # -------------------------
 stealth_async = None
 try:
-    # PyPI layout: playwright_stealth/stealth.py
     from playwright_stealth.stealth import stealth_async
 except Exception:
     try:
-        # fallback: direct export (older variants)
         from playwright_stealth import stealth_async
     except Exception:
         stealth_async = None
@@ -47,7 +42,7 @@ def extract_filename_from_cd(cd: str):
     m2 = re.search(r'filename="?([^\";]+)"?', cd)
     return m2.group(1) if m2 else None
 
-def guess_name(headers: dict, url: str, suggested=None):
+def guess_name_from_headers(headers: dict, url: str, suggested: str = None):
     cd = headers.get("content-disposition") if headers else None
     name = extract_filename_from_cd(cd) if cd else None
     if name:
@@ -65,206 +60,94 @@ def guess_name(headers: dict, url: str, suggested=None):
 # DownloaderBotAsync
 # -------------------------
 class DownloaderBotAsync:
-    def __init__(self, url: str):
+    def __init__(self, url: str, max_attempts: int = 3):
         self.url = url
         self.bot_token = os.environ.get("BOT_TOKEN")
         self.owner_id = os.environ.get("PAYLOAD_SENDER")
         self.initial_message_id = None
+        self.max_attempts = max_attempts
 
     # Telegram helper (best-effort)
     async def _send_telegram(self, text: str):
         if not self.bot_token or not self.owner_id:
             print("[TELEGRAM NOT CONFIGURED]", text)
             return
-        mode = "editMessageText" if self.initial_message_id else "sendMessage"
-        api_url = f"https://api.telegram.org/bot{self.bot_token}/{mode}"
+        api_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = {"chat_id": self.owner_id, "text": text, "parse_mode": "Markdown"}
-        if self.initial_message_id:
-            payload["message_id"] = self.initial_message_id
         try:
-            res = await asyncio.to_thread(requests.post, api_url, json=payload, timeout=10)
-            data = res.json()
-            if not self.initial_message_id:
-                self.initial_message_id = data.get('result', {}).get('message_id')
+            await asyncio.to_thread(__import__("requests").post, api_url, json=payload, timeout=10)
         except Exception as e:
             print("Telegram send failed:", e)
 
-    # aria2c then requests fallback
-    async def _download_aria2(self, url: str, name: str):
-        if shutil.which("aria2c"):
-            await self._send_telegram(f"⚡ Aria2c: `{name}`")
-            cmd = [
-                "aria2c", "-x", "16", "-s", "16", "-c",
-                "--header=User-Agent: Mozilla/5.0",
-                f"--header=Referer: {self.url}",
-                "-o", name, url
-            ]
-            proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = await proc.communicate()
-            if proc.returncode == 0 and os.path.exists(name):
-                return name
-            print("aria2c failed:", stderr.decode(errors="ignore"))
+    # detect countdown/timer on page; return seconds to wait (0 if none)
+    async def _detect_countdown_seconds(self, page):
+        # try common DOM patterns and inline scripts
         try:
-            await self._send_telegram(f"⬇️ Requests fallback: `{name}`")
-            with requests.get(url, stream=True, timeout=30) as r:
-                r.raise_for_status()
-                fname = guess_name(r.headers, r.url, suggested=name)
-                with open(fname, "wb") as f:
-                    for chunk in r.iter_content(8192):
-                        if chunk:
-                            f.write(chunk)
-                return fname
-        except Exception as e:
-            print("requests fallback failed:", e)
-        return None
-
-    # detect and wait for JS-driven timers or readiness flags
-    async def _detect_and_wait_timer(self, page, max_wait=30):
-        """
-        Wait for common JS-driven readiness signals:
-        - networkidle
-        - window.downloadReady === true
-        - visible countdown element or numeric text
-        - meta refresh
-        Returns total waited seconds.
-        """
-        waited = 0
-        # 1) wait for network idle briefly
-        try:
-            await page.wait_for_load_state("networkidle", timeout=5000)
-        except:
-            pass
-
-        # 2) check for JS readiness flag (downloadReady)
-        try:
-            ready = await page.evaluate("() => (typeof window.downloadReady !== 'undefined' && !!window.downloadReady)")
-            if ready:
-                return waited
-        except:
-            pass
-
-        # 3) wait for visible countdown element or numeric text using wait_for_function
-        try:
-            # function returns remaining seconds if found, else 0
-            js = """
+            # 1) visible countdown element (#countdown, .countdown, .timer)
+            js_check = """
             () => {
-                // look for common countdown elements
-                const sel = document.querySelector('#countdown, .countdown, .timer, [data-countdown], [data-seconds]');
+                const sel = document.querySelector('#countdown, .countdown, .timer, [data-countdown], [data-seconds], [data-timer]');
                 if (sel) {
                     const txt = (sel.innerText || sel.textContent || '').trim();
                     const m = txt.match(/(\\d{1,3})/);
                     if (m) return parseInt(m[1], 10);
+                    const v = sel.getAttribute('data-countdown') || sel.getAttribute('data-seconds') || sel.getAttribute('data-timer');
+                    if (v) return parseInt(v,10) || 0;
                 }
-                // look for data attributes
-                const el = document.querySelector('[data-countdown],[data-seconds],[data-timer]');
-                if (el) {
-                    const v = el.getAttribute('data-countdown') || el.getAttribute('data-seconds') || el.getAttribute('data-timer');
-                    if (v) return parseInt(v, 10) || 0;
+                // meta refresh
+                const meta = document.querySelector('meta[http-equiv=refresh]');
+                if (meta) {
+                    const c = meta.getAttribute('content') || '';
+                    const m2 = c.match(/(\\d+)/);
+                    if (m2) return parseInt(m2[1],10);
                 }
+                // inline script setTimeout detection (ms)
+                const scripts = Array.from(document.scripts).map(s => s.textContent || '').join('\\n');
+                const m3 = scripts.match(/setTimeout\\s*\\([^,]+,\\s*(\\d{3,6})\\s*\\)/);
+                if (m3) return Math.ceil(parseInt(m3[1],10)/1000);
                 return 0;
             }
             """
-            remaining = await page.wait_for_function(js, timeout=2000)
-            rem_val = 0
+            val = await page.evaluate(js_check)
             try:
-                rem_val = int(await remaining.json_value())
+                secs = int(val or 0)
             except:
-                rem_val = 0
-            if rem_val > 0:
-                wait_ms = min(rem_val * 1000 + 500, max_wait * 1000)
-                await self._send_telegram(f"⏳ Detected countdown: menunggu {rem_val}s")
-                await page.wait_for_timeout(wait_ms)
-                waited += rem_val
-                return waited
+                secs = 0
+            return max(0, secs)
         except Exception:
-            pass
+            return 0
 
-        # 4) meta refresh
-        try:
-            content = await page.content()
-            m = re.search(r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\']?(\d+)', content, flags=re.IGNORECASE)
-            if m:
-                secs = int(m.group(1))
-                await self._send_telegram(f"⏳ Meta refresh detected: menunggu {secs}s")
-                await page.wait_for_timeout(min(secs * 1000 + 500, max_wait * 1000))
-                waited += secs
-                return waited
-        except:
-            pass
-
-        # 5) fallback small wait to allow JS to finish
-        await page.wait_for_timeout(1000)
-        return waited
-
-    # APKAdmin 3-click flow with robust waits
-    async def _apkadmin_clicks(self, page):
-        # ensure JS rendering: wait for networkidle and for at least one of expected selectors
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10000)
-        except:
-            pass
-
-        # wait for either Free Download or Generate Link to appear
-        try:
-            await page.wait_for_selector("text=/.*(Free Download|Generate|Create|Get).*Link.*/i", timeout=7000)
-        except:
-            # no obvious selector; continue anyway
-            pass
-
-        # 1) Free Download (if present)
-        try:
-            btn1 = page.locator("text=/.*Free Download.*/i").first
-            if await btn1.count() and await btn1.is_visible():
-                await self._send_telegram("🔘 Klik 1: Free Download")
-                await btn1.click()
-        except Exception:
-            pass
-
-        # detect and wait timers or readiness after first click
-        await self._detect_and_wait_timer(page)
-
-        # 2) Generate Link (if present)
-        try:
-            btn2 = page.locator("text=/.*(Generate|Create|Get).*Link.*/i").first
-            if await btn2.count() and await btn2.is_visible():
-                await self._send_telegram("🔘 Klik 2: Generate Link")
-                # prefer wait_for_selector for any resulting download link element
+    # wait for selector from list to appear within timeout seconds; return the selector found or None
+    async def _wait_for_any_selector(self, page, selectors, timeout=10000):
+        # try waiting for any selector by polling each with small timeout slices
+        end = asyncio.get_event_loop().time() + (timeout / 1000)
+        while asyncio.get_event_loop().time() < end:
+            for sel in selectors:
                 try:
-                    await btn2.click()
-                except:
-                    pass
-        except Exception:
-            pass
-
-        # detect and wait timers or readiness after second click
-        await self._detect_and_wait_timer(page)
-
-        # 3) Click here to download (explicit)
-        try:
-            # wait for the final download link/button to appear
-            try:
-                await page.wait_for_selector("text=/.*Click here to download.*/i", timeout=8000)
-            except:
-                pass
-            btn3 = page.locator("text=/.*Click here to download.*/i").first
-            if await btn3.count() and await btn3.is_visible():
-                await self._send_telegram("🔘 Klik 3: Click here to download")
-                try:
-                    async with page.expect_download(timeout=20000) as d:
-                        await btn3.click()
-                    download = await d.value
-                    fname = download.suggested_filename or "downloaded_file"
-                    await download.save_as(fname)
-                    return fname
-                except PlaywrightTimeout:
-                    pass
-        except Exception:
-            pass
-
+                    handle = page.locator(sel).first
+                    if await handle.count() and await handle.is_visible():
+                        return sel
+                except Exception:
+                    continue
+            await asyncio.sleep(0.25)
         return None
 
-    # sniffer fallback: capture file-like responses
-    async def _sniffer_fallback(self, page, wait_ms=3000):
+    # try clicking a locator and use Playwright default download capture
+    async def _click_and_capture_download(self, page, locator, timeout=20000):
+        try:
+            async with page.expect_download(timeout=timeout) as d:
+                await locator.click()
+            download = await d.value
+            fname = download.suggested_filename or "downloaded_file"
+            await download.save_as(fname)
+            return fname
+        except PlaywrightTimeout:
+            return None
+        except Exception:
+            return None
+
+    # sniff network responses for file-like URLs (simple, short window)
+    async def _sniff_for_file(self, page, wait_ms=2500):
         sniffed = []
         last_headers = {}
 
@@ -280,7 +163,7 @@ class DownloaderBotAsync:
                 if ("application/" in ctype or "octet-stream" in ctype or "attachment" in cd or url.lower().endswith((".apk", ".zip", ".exe", ".msi"))):
                     if url not in sniffed:
                         sniffed.append(url)
-            except:
+            except Exception:
                 pass
 
         page.on("response", on_response)
@@ -288,76 +171,175 @@ class DownloaderBotAsync:
         if sniffed:
             target = sniffed[-1]
             headers = last_headers.get(target, {})
-            fname = guess_name(headers, target)
-            return await self._download_aria2(target, fname)
+            suggested = guess_name_from_headers(headers, target)
+            # use Playwright default download by navigating to the URL in same context
+            try:
+                # open a new page to trigger browser download
+                newp = await page.context.new_page()
+                await newp.goto(target, wait_until="domcontentloaded")
+                # try to capture download event if server triggers it
+                try:
+                    async with newp.expect_download(timeout=10000) as d:
+                        # attempt to click any direct anchor if present
+                        anchors = newp.locator("a[href]").all()
+                        # if no download event, just wait a bit
+                        pass
+                    download = await d.value
+                    fname = download.suggested_filename or suggested
+                    await download.save_as(fname)
+                    await newp.close()
+                    return fname
+                except Exception:
+                    # fallback: return target URL so caller can handle
+                    await newp.close()
+                    return await self._download_via_navigate(target, suggested)
+            except Exception:
+                return await self._download_via_navigate(target, suggested)
         return None
 
-    # main browser orchestration with deterministic waits
+    # simple navigate-and-save using browser download (default) or fallback to direct GET if needed
+    async def _download_via_navigate(self, url, suggested):
+        # try to use Playwright's default by opening a new browser context/page
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+                context = await browser.new_context(user_agent="Mozilla/5.0")
+                page = await context.new_page()
+                try:
+                    async with page.expect_download(timeout=15000) as d:
+                        await page.goto(url, wait_until="domcontentloaded")
+                    download = await d.value
+                    fname = download.suggested_filename or suggested or "downloaded_file"
+                    await download.save_as(fname)
+                    await browser.close()
+                    return fname
+                except Exception:
+                    await browser.close()
+        except Exception:
+            pass
+        # last resort: use requests (synchronous) to fetch
+        try:
+            import requests
+            r = requests.get(url, stream=True, timeout=30)
+            r.raise_for_status()
+            fname = guess_name_from_headers(r.headers, r.url, suggested)
+            with open(fname, "wb") as f:
+                for chunk in r.iter_content(8192):
+                    if chunk:
+                        f.write(chunk)
+            return fname
+        except Exception:
+            return None
+
+    # main orchestration per user's spec
     async def _run_browser(self):
+        selectors = [
+            "text=/.*Click here to download.*/i",
+            "a[href$='.apk']",
+            "a:has-text('Download')",
+            "text=/.*Free Download.*/i",
+            "text=/.*(Generate|Create|Get).*Link.*/i",
+            "button:has-text('Download')",
+            "a[class*='download']",
+            "a[href*='download']"
+        ]
+
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             page = await context.new_page()
 
-            # apply stealth if available
             await apply_stealth(page)
 
-            # navigate and wait for JS rendering (networkidle + selector/function)
             await page.goto(self.url, wait_until="domcontentloaded")
-            try:
-                await page.wait_for_load_state("networkidle", timeout=10000)
-            except:
-                pass
-
-            # additional deterministic wait: wait for either known buttons or a readiness flag
-            try:
-                await page.wait_for_function(
-                    """() => {
-                        if (typeof window.downloadReady !== 'undefined' && window.downloadReady) return true;
-                        if (document.querySelector('text, a, button')) return true;
-                        return false;
-                    }""",
-                    timeout=8000
-                )
-            except:
-                pass
-
-            # Try APKAdmin 3-click flow (with timer detection between steps)
-            result = await self._apkadmin_clicks(page)
-            if result:
-                await browser.close()
-                return result
-
-            # If not found, run sniffer fallback (after checking for timers)
-            await self._detect_and_wait_timer(page)
-            result = await self._sniffer_fallback(page)
-            if result:
-                await browser.close()
-                return result
-
-            # Retry: reload and attempt again with deterministic waits
-            await self._send_telegram("🔁 Mencoba ulang: reload dan cek lagi...")
-            try:
-                await page.reload(wait_until="domcontentloaded")
-            except:
-                pass
             try:
                 await page.wait_for_load_state("networkidle", timeout=8000)
             except:
                 pass
-            await self._detect_and_wait_timer(page)
-            result = await self._apkadmin_clicks(page)
-            if result:
+
+            # 1) Wait up to 10s for any selector from bruteforce list to appear
+            found_sel = await self._wait_for_any_selector(page, selectors, timeout=10000)
+            if not found_sel:
                 await browser.close()
-                return result
+                raise Exception("Tidak ada selector yang muncul dalam 10 detik; keluar sebagai gagal.")
 
-            # final sniff fallback
-            result = await self._sniffer_fallback(page, wait_ms=4000)
+            await self._send_telegram(f"🔎 Selector pertama ditemukan: `{found_sel}` — mulai klik dan capture")
+
+            # attempts loop: click found selector and try to capture download; if no download, detect timer and repeat bruteforce
+            attempts = 0
+            while attempts < self.max_attempts:
+                attempts += 1
+                # re-evaluate locator each attempt
+                try:
+                    locator = page.locator(found_sel).first
+                    if await locator.count() and await locator.is_visible():
+                        # try default Playwright download capture
+                        fname = await self._click_and_capture_download(page, locator, timeout=20000)
+                        if fname:
+                            await browser.close()
+                            return fname
+                        # if no download event, click (best-effort) and continue
+                        try:
+                            await locator.click()
+                        except Exception:
+                            pass
+                    else:
+                        # if the originally found selector disappeared, try to find any selector again quickly
+                        new_sel = await self._wait_for_any_selector(page, selectors, timeout=3000)
+                        if new_sel:
+                            found_sel = new_sel
+                            continue
+                except Exception:
+                    pass
+
+                # after click attempt, check for countdown timer
+                secs = await self._detect_countdown_seconds(page)
+                if secs and secs > 0:
+                    await self._send_telegram(f"⏳ Countdown detected: menunggu {secs}s sebelum bruteforce ulang")
+                    await page.wait_for_timeout(min(secs * 1000 + 500, 60000))
+                else:
+                    # no timer detected: perform bruteforce scan (try all selectors in order)
+                    await self._send_telegram("🔁 Tidak ada timer — melakukan bruteforce ulang dengan selector list")
+                    for sel in selectors:
+                        try:
+                            loc = page.locator(sel).first
+                            if await loc.count() and await loc.is_visible():
+                                fname = await self._click_and_capture_download(page, loc, timeout=15000)
+                                if fname:
+                                    await browser.close()
+                                    return fname
+                                try:
+                                    await loc.click()
+                                except:
+                                    pass
+                                # short sniff window after each click
+                                sniffed = await self._sniff_for_file(page, wait_ms=2000)
+                                if sniffed:
+                                    await browser.close()
+                                    return sniffed
+                        except Exception:
+                            continue
+
+                # if still no file, small wait then retry: reload to re-trigger scripts if needed
+                await self._send_telegram(f"🔁 Percobaan {attempts} selesai tanpa file, reload dan coba lagi")
+                try:
+                    await page.reload(wait_until="domcontentloaded")
+                except:
+                    pass
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8000)
+                except:
+                    pass
+                # find a selector again before next attempt
+                new_sel = await self._wait_for_any_selector(page, selectors, timeout=3000)
+                if new_sel:
+                    found_sel = new_sel
+                else:
+                    # if none found quickly, break early
+                    await browser.close()
+                    raise Exception("Selector hilang setelah reload; keluar sebagai gagal.")
             await browser.close()
-            if result:
-                return result
-
-            raise Exception("Tidak menemukan file setelah semua langkah (render wait + 3 klik + sniff + retry).")
+            raise Exception("Gagal menemukan file setelah beberapa percobaan.")
 
     async def run(self):
         await self._send_telegram(f"🚀 Mulai: `{self.url}`")
@@ -367,6 +349,7 @@ class DownloaderBotAsync:
             return result
         except Exception as e:
             await self._send_telegram(f"💥 Error: `{e}`")
+            print("Final error:", e)
             return None
 
 # -------------------------
