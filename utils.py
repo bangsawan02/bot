@@ -144,7 +144,7 @@ class DownloaderBot:
             return await self._handle_mega()
 
         # 2. Browser Path (Stealth correctly implemented)
-        async with async_playwright() as p:
+        async with Stealth().use_async(async_playwright()) as p:
             # CI/Docker friendly args
             browser = await p.chromium.launch(
                 headless=True, 
@@ -158,7 +158,7 @@ class DownloaderBot:
             page = await context.new_page()
             
             # Terapkan Stealth ke PAGE, bukan ke playwright object
-            await Stealth().apply_async(page)
+            # await Stealth().apply_async(page)
 
             try:
                 await self._notify(f"🌐 Opening: {self.url}")
