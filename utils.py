@@ -4,6 +4,8 @@ import sys
 import asyncio
 import tempfile
 import mimetypes
+import base64
+import uuid
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from playwright_stealth import Stealth
@@ -39,7 +41,7 @@ def guess_name_from_headers(headers: dict, url: str, suggested: str = None):
     return sanitize_filename("downloaded_file" + ext)
 
 # -------------------------
-# Telegram helpers (blocking requests run in thread)
+# Telegram helpers
 # -------------------------
 def _tg_send_message_sync(bot_token: str, chat_id: str, text: str):
     import requests
@@ -63,7 +65,154 @@ def _tg_send_document_sync(bot_token: str, chat_id: str, file_path: str, caption
         print("Telegram send document failed:", e)
 
 # -------------------------
-# Main downloader class (uses Stealth wrapper)
+# Robust click-and-capture helper
+# -------------------------
+async def click_and_capture(page, selector, timeout_download=30000):
+    """
+    Try multiple strategies to capture a download triggered by clicking selector:
+    - expect_download on same page
+    - detect popup/new page and expect_download there
+    - sniff network responses for file-like responses and navigate to trigger download
+    - handle blob: href by fetching blob and saving locally
+    Returns saved filename or None.
+    """
+    def is_file_response(resp):
+        try:
+            url = (resp.url or "").lower()
+            ctype = (resp.headers.get("content-type") or "").lower()
+            if url.endswith((".apk", ".zip", ".exe", ".msi")):
+                return True
+            if "application/vnd.android.package-archive" in ctype or "application/octet-stream" in ctype:
+                return True
+        except Exception:
+            pass
+        return False
+
+    locator = page.locator(selector).first
+    if not (await locator.count()):
+        return None
+
+    try:
+        await locator.scroll_into_view_if_needed()
+    except:
+        pass
+
+    file_response = {"resp": None}
+    async def on_response(resp):
+        try:
+            if is_file_response(resp):
+                file_response["resp"] = resp
+        except:
+            pass
+    page.on("response", on_response)
+
+    # 1) expect_download on same page
+    try:
+        async with page.expect_download(timeout=timeout_download) as d:
+            await locator.click()
+        download = await d.value
+        fname = download.suggested_filename or f"downloaded_{uuid.uuid4().hex}"
+        await download.save_as(fname)
+        page.off("response", on_response)
+        return fname
+    except Exception:
+        pass
+
+    # 2) click and wait for popup/new page
+    try:
+        await locator.click()
+    except:
+        pass
+
+    try:
+        new_page = await page.context.wait_for_event("page", timeout=3000)
+    except:
+        new_page = None
+
+    if new_page:
+        try:
+            async with new_page.expect_download(timeout=timeout_download) as d2:
+                # allow page to run scripts
+                try:
+                    await new_page.wait_for_load_state("domcontentloaded", timeout=3000)
+                except:
+                    pass
+            download2 = await d2.value
+            fname2 = download2.suggested_filename or f"downloaded_{uuid.uuid4().hex}"
+            await download2.save_as(fname2)
+            page.off("response", on_response)
+            return fname2
+        except Exception:
+            # try sniffing responses on new_page
+            try:
+                resp = await new_page.wait_for_response(lambda r: is_file_response(r), timeout=5000)
+                url = resp.url
+                tmp = await page.context.new_page()
+                try:
+                    async with tmp.expect_download(timeout=15000) as d3:
+                        await tmp.goto(url, wait_until="domcontentloaded")
+                    dl3 = await d3.value
+                    fn3 = dl3.suggested_filename or f"downloaded_{uuid.uuid4().hex}"
+                    await dl3.save_as(fn3)
+                    await tmp.close()
+                    page.off("response", on_response)
+                    return fn3
+                except:
+                    await tmp.close()
+            except:
+                pass
+
+    # 3) sniffed response on original page
+    if file_response.get("resp"):
+        resp = file_response["resp"]
+        url = resp.url
+        try:
+            tmp = await page.context.new_page()
+            try:
+                async with tmp.expect_download(timeout=15000) as d4:
+                    await tmp.goto(url, wait_until="domcontentloaded")
+                dl4 = await d4.value
+                fn4 = dl4.suggested_filename or f"downloaded_{uuid.uuid4().hex}"
+                await dl4.save_as(fn4)
+                await tmp.close()
+                page.off("response", on_response)
+                return fn4
+            except:
+                await tmp.close()
+        except:
+            pass
+
+    # 4) blob href handling
+    try:
+        href = await locator.get_attribute("href")
+        if href and href.startswith("blob:"):
+            b64 = await page.evaluate(
+                """async (blobUrl) => {
+                    const res = await fetch(blobUrl);
+                    const buf = await res.arrayBuffer();
+                    let binary = '';
+                    const bytes = new Uint8Array(buf);
+                    for (let i = 0; i < bytes.byteLength; i++) {
+                        binary += String.fromCharCode(bytes[i]);
+                    }
+                    return btoa(binary);
+                }""",
+                href
+            )
+            data = base64.b64decode(b64)
+            fname = f"downloaded_{uuid.uuid4().hex}.apk"
+            with open(fname, "wb") as f:
+                f.write(data)
+            page.off("response", on_response)
+            return fname
+    except Exception:
+        pass
+
+    page.off("response", on_response)
+    return None
+
+# -------------------------
+# Main downloader class
 # -------------------------
 class DownloaderBot:
     def __init__(self, url: str, max_attempts: int = 5):
@@ -71,8 +220,6 @@ class DownloaderBot:
         self.bot_token = os.environ.get("BOT_TOKEN")
         self.chat_id = os.environ.get("PAYLOAD_SENDER")
         self.max_attempts = max_attempts
-
-        # selector list to scan
         self.selectors = [
             "text=/.*Click here to download.*/i",
             "a[href$='.apk']",
@@ -96,66 +243,6 @@ class DownloaderBot:
             return
         await asyncio.to_thread(_tg_send_document_sync, self.bot_token, self.chat_id, path, caption)
 
-    # wait up to timeout_ms for any selector in list to appear; return selector string or None
-    async def _wait_for_any_selector(self, page, timeout_ms: int = 10000):
-        end = asyncio.get_event_loop().time() + (timeout_ms / 1000)
-        while asyncio.get_event_loop().time() < end:
-            for sel in self.selectors:
-                try:
-                    loc = page.locator(sel).first
-                    if await loc.count() and await loc.is_visible():
-                        return sel
-                except Exception:
-                    continue
-            await asyncio.sleep(0.25)
-        return None
-
-    # click locator and capture Playwright default download
-    async def _click_and_expect_download(self, page, locator, timeout_ms: int = 20000):
-        try:
-            async with page.expect_download(timeout=timeout_ms) as d:
-                await locator.click()
-            download = await d.value
-            fname = download.suggested_filename or "downloaded_file"
-            await download.save_as(fname)
-            return fname
-        except PlaywrightTimeout:
-            return None
-        except Exception:
-            return None
-
-    # scan all selectors once: click each and check download
-    async def _bruteforce_once(self, page):
-        for sel in self.selectors:
-            try:
-                loc = page.locator(sel).first
-                if not (await loc.count()) or not (await loc.is_visible()):
-                    continue
-                # try expect_download first
-                fname = await self._click_and_expect_download(page, loc, timeout_ms=15000)
-                if fname:
-                    return fname
-                # if no download event, click and give a short moment
-                try:
-                    await loc.click()
-                except:
-                    pass
-                await page.wait_for_timeout(1000)
-                # short post-click download wait
-                try:
-                    async with page.expect_download(timeout=5000) as d2:
-                        pass
-                    download = await d2.value
-                    fname2 = download.suggested_filename or "downloaded_file"
-                    await download.save_as(fname2)
-                    return fname2
-                except:
-                    pass
-            except Exception:
-                continue
-        return None
-
-    # take screenshot to temp file
     async def _screenshot_temp(self, page):
         fd, path = tempfile.mkstemp(suffix=".png")
         os.close(fd)
@@ -169,26 +256,35 @@ class DownloaderBot:
                 pass
             return None
 
-    # main orchestration using Stealth wrapper
     async def run(self):
         await self._send_telegram(f"🚀 Mulai download: `{self.url}`")
-
-        # Use Stealth wrapper so all contexts/pages have stealth applied
         async with Stealth().use_async(async_playwright()) as p:
-            # p behaves like the async_playwright() object
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            context = await browser.new_context(user_agent="Mozilla/5.0")
             page = await context.new_page()
 
-            # navigate and give JS some time to run
             await page.goto(self.url, wait_until="domcontentloaded")
             try:
                 await page.wait_for_load_state("networkidle", timeout=8000)
             except:
                 pass
 
-            # 1) wait up to 10s for any selector to appear
-            found = await self._wait_for_any_selector(page, timeout_ms=10000)
+            # initial wait: look for any selector within 10s
+            found = None
+            end = asyncio.get_event_loop().time() + 10
+            while asyncio.get_event_loop().time() < end:
+                for sel in self.selectors:
+                    try:
+                        loc = page.locator(sel).first
+                        if await loc.count() and await loc.is_visible():
+                            found = sel
+                            break
+                    except:
+                        continue
+                if found:
+                    break
+                await asyncio.sleep(0.25)
+
             if not found:
                 shot = await self._screenshot_temp(page)
                 if shot:
@@ -211,20 +307,31 @@ class DownloaderBot:
                 try:
                     loc = page.locator(found).first
                     if (await loc.count()) and (await loc.is_visible()):
-                        fname = await self._click_and_expect_download(page, loc, timeout_ms=20000)
-                        if fname:
-                            await self._send_telegram(f"✅ Download berhasil: `{fname}`")
-                            await self._send_telegram_file(fname, caption=f"File: {fname}")
+                        result = await click_and_capture(page, found, timeout_download=20000)
+                        if result:
+                            await self._send_telegram(f"✅ Download berhasil: `{result}`")
+                            await self._send_telegram_file(result, caption=f"File: {result}")
                             await browser.close()
-                            return fname
-                        # if no download event, click and continue
+                            return result
+                        # if not captured, click once more to trigger potential JS
                         try:
                             await loc.click()
                         except:
                             pass
                     else:
                         # if locator disappeared, try to find any selector quickly
-                        new_found = await self._wait_for_any_selector(page, timeout_ms=3000)
+                        new_found = None
+                        end2 = asyncio.get_event_loop().time() + 3
+                        while asyncio.get_event_loop().time() < end2 and not new_found:
+                            for sel in self.selectors:
+                                try:
+                                    l2 = page.locator(sel).first
+                                    if await l2.count() and await l2.is_visible():
+                                        new_found = sel
+                                        break
+                                except:
+                                    continue
+                            await asyncio.sleep(0.2)
                         if new_found:
                             found = new_found
                             await self._send_telegram(f"🔁 Selector berganti ke `{found}` — lanjut")
@@ -232,14 +339,26 @@ class DownloaderBot:
                 except Exception:
                     pass
 
-                # bruteforce scan all selectors
+                # bruteforce scan all selectors once
                 await self._send_telegram(f"🔁 Percobaan {attempt}: scan ulang selector")
-                result = await self._bruteforce_once(page)
-                if result:
-                    await self._send_telegram(f"✅ Download berhasil: `{result}`")
-                    await self._send_telegram_file(result, caption=f"File: {result}")
-                    await browser.close()
-                    return result
+                for sel in self.selectors:
+                    try:
+                        loc = page.locator(sel).first
+                        if not (await loc.count()) or not (await loc.is_visible()):
+                            continue
+                        result = await click_and_capture(page, sel, timeout_download=15000)
+                        if result:
+                            await self._send_telegram(f"✅ Download berhasil: `{result}`")
+                            await self._send_telegram_file(result, caption=f"File: {result}")
+                            await browser.close()
+                            return result
+                        try:
+                            await loc.click()
+                        except:
+                            pass
+                        await page.wait_for_timeout(1000)
+                    except Exception:
+                        continue
 
                 # reload and try again
                 await self._send_telegram(f"🔁 Percobaan {attempt} gagal, reload halaman dan coba lagi")
@@ -251,9 +370,23 @@ class DownloaderBot:
                     await page.wait_for_load_state("networkidle", timeout=8000)
                 except:
                     pass
-                new_found = await self._wait_for_any_selector(page, timeout_ms=5000)
+
+                # find selector after reload
+                new_found = None
+                end3 = asyncio.get_event_loop().time() + 5
+                while asyncio.get_event_loop().time() < end3 and not new_found:
+                    for sel in self.selectors:
+                        try:
+                            l3 = page.locator(sel).first
+                            if await l3.count() and await l3.is_visible():
+                                new_found = sel
+                                break
+                        except:
+                            continue
+                    await asyncio.sleep(0.25)
                 if new_found:
                     found = new_found
+                    continue
                 else:
                     shot = await self._screenshot_temp(page)
                     if shot:
@@ -283,14 +416,14 @@ class DownloaderBot:
             return None
 
 # -------------------------
-# CLI runner
+# CLI runner (example)
 # -------------------------
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python downloader.py <url>")
+        print("Usage: python utils.py <url>")
         sys.exit(1)
     url = sys.argv[1]
-    bot = DownloaderBot(url, max_attempts=5)
+    bot = DownloaderBot(url, max_attempts=3)
     async def main():
         res = await bot.run()
         if res:
