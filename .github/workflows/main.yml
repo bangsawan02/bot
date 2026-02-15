@@ -50,7 +50,6 @@ jobs:
 
       - name: Install System Dependencies
         run: |
-          sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb
           if [[ "${{ env.PAYLOAD_URL }}" == *"mega.nz"* ]]; then
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends megatools
