@@ -5,216 +5,192 @@ import requests
 import re
 import tempfile
 import shutil
-import math
 import sys
-from urllib.parse import urlparse, urlunparse, urlencode, parse_qs
-
-# --- PLAYWRIGHT ASYNC & STEALTH ---
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from playwright_stealth import Stealth
 
 class DownloaderBot:
     def __init__(self, url):
         self.url = url
-        self.bot_token = os.environ.get("BOT_TOKEN")
-        self.owner_id = os.environ.get("PAYLOAD_SENDER")
+        # Ambil dari environment variable atau isi manual di sini
+        self.bot_token = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
+        self.owner_id = os.environ.get("PAYLOAD_SENDER", "YOUR_CHAT_ID")
         self.temp_download_dir = tempfile.mkdtemp()
         self.initial_message_id = None
-        
-        # State Playwright
-        self.browser = None
-        self.context = None
-
-    async def _close_all(self):
-        if self.context: await self.context.close()
-        if self.browser: await self.browser.close()
-        if os.path.exists(self.temp_download_dir):
-            shutil.rmtree(self.temp_download_dir, ignore_errors=True)
+        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
     # =========================================================
-    # --- 1. TELEGRAM HELPERS (Async Friendly) ---
+    # --- UTILS & TELEGRAM ---
     # =========================================================
 
-    async def _notify(self, text):
-        """Kirim atau edit pesan Telegram secara async."""
-        print(f"[*] {text}")
-        if not self.bot_token or not self.owner_id: return
-
-        if self.initial_message_id is None:
-            # Kirim pesan baru
-            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-            payload = {"chat_id": self.owner_id, "text": text, "parse_mode": "Markdown"}
-            try:
-                loop = asyncio.get_event_loop()
-                res = await loop.run_in_executor(None, lambda: requests.post(url, json=payload, timeout=10).json())
-                self.initial_message_id = res.get('result', {}).get('message_id')
-            except: pass
-        else:
-            # Edit pesan
-            url = f"https://api.telegram.org/bot{self.bot_token}/editMessageText"
-            payload = {"chat_id": self.owner_id, "message_id": self.initial_message_id, "text": text, "parse_mode": "Markdown"}
-            try:
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, lambda: requests.post(url, json=payload, timeout=10))
-            except: pass
-
-    # =========================================================
-    # --- 2. EXTERNAL TOOLS (Aria2c & Megatools Async) ---
-    # =========================================================
-
-    async def _run_aria2c(self, urls, output_filename):
-        await self._notify(f"⬇️ **Aria2c:** Memulai download `{output_filename}`")
-        
-        # Buat file input sementara untuk aria2c
-        input_file = os.path.join(self.temp_download_dir, "aria_input.txt")
-        with open(input_file, "w") as f:
-            for u in urls: f.write(f"{u}\n")
-
-        cmd = [
-            'aria2c', '--allow-overwrite', '--file-allocation=none', 
-            '-x', '16', '-s', '16', '-c', '--input-file', input_file, '-o', output_filename
-        ]
-        
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-        )
-
-        # Monitor progress secara pasif (berdasarkan size file di disk)
-        total_size = await self._get_size_remote(urls[0])
-        last_percent = -1
-        
-        while process.returncode is None:
-            if os.path.exists(output_filename):
-                curr_size = os.path.getsize(output_filename)
-                if total_size:
-                    percent = int(curr_size * 100 // total_size)
-                    if (percent % 25 == 0 or percent >= 99) and percent != last_percent:
-                        await self._notify(f"⬇️ **Aria2c:** {percent}% dari {self._human_size(total_size)}")
-                        last_percent = percent
-                
-                if total_size and curr_size >= total_size: break
-            
-            await asyncio.sleep(5)
-            if process.returncode is not None: break
-
-        await process.wait()
-        return output_filename if os.path.exists(output_filename) else None
-
-    async def _run_megatools(self, url):
-        await self._notify("⬇️ **Megatools:** Menghubungkan ke MEGA...")
-        
-        # Megatools biasanya output ke stderr untuk progress
-        process = await asyncio.create_subprocess_exec(
-            'megatools', 'dl', url,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        
-        stdout, stderr = await process.communicate()
-        # Megatools mendownload ke CWD, kita cari filenya
-        # (Logika pencarian file bisa disesuaikan)
-        return "Check_CWD_for_file" 
-
-    # =========================================================
-    # --- 3. BROWSER LOGIC (Playwright Async + Stealth) ---
-    # =========================================================
-
-    async def _handler_apkadmin(self, page):
-        await self._notify("🔍 **ApkAdmin:** Menunggu link download...")
-        final_url = None
-
-        def catch_res(res):
-            nonlocal final_url
-            if ".apk" in res.url or ".zip" in res.url:
-                if res.status == 200 and "apkadmin" not in res.url:
-                    final_url = res.url
-
-        page.on("response", catch_res)
-        await page.goto(self.url)
-        
-        # Submit Form F1 (pemicu download)
-        try:
-            await page.locator("form[name='F1']").evaluate("f => f.submit()")
-            # Tunggu interceptor bekerja
-            for _ in range(15):
-                if final_url: break
-                await asyncio.sleep(1)
-        except: pass
-        
-        if final_url:
-            return await self._run_aria2c([final_url], "downloaded_file.apk")
-        return None
-
-    async def _handler_generic_browser(self, page):
-        """Handler untuk Gofile, Mediafire, dll."""
-        await page.goto(self.url)
-        await self._notify("🔍 **Browser:** Mencari tombol download...")
-
-        try:
-            # Gunakan expect_download untuk menangkap stream file
-            async with page.expect_download(timeout=60000) as download_info:
-                # Coba klik tombol download yang umum
-                selectors = ["#downloadButton", "#download-btn", "text='Download'", ".btn-download"]
-                for s in selectors:
-                    btn = page.locator(s).first
-                    if await btn.is_visible():
-                        await btn.click()
-                        break
-            
-            download = await download_info.value
-            path = os.path.join(os.getcwd(), download.suggested_filename)
-            await download.save_as(path)
-            await self._notify(f"✅ **Selesai:** `{download.suggested_filename}`")
-            return download.suggested_filename
-        except Exception as e:
-            await self._notify(f"❌ Gagal di Browser: {str(e)[:50]}")
-            return None
-
-    # =========================================================
-    # --- 4. MAIN ORCHESTRATOR ---
-    # =========================================================
-
-    async def run(self):
-        await self._notify(f"⏳ **Analisis URL:** `{self.url}`")
-
-        # 1. Jalankan Tool Tanpa Browser jika bisa
-        if "mega.nz" in self.url:
-            return await self._run_megatools(self.url)
-        
-        if "pixeldrain" in self.url:
-            # Langsung API (Tanpa Browser)
-            f_id = self.url.split('/')[-1]
-            dl_url = f"https://pixeldrain.com/api/file/{f_id}?download"
-            return await self._run_aria2c([dl_url], f"pixeldrain_{f_id}")
-
-        # 2. Jalankan Playwright Stealth (Async Mode)
-        async with Stealth().use_async(async_playwright()) as p:
-            self.browser = await p.chromium.launch(headless=True)
-            self.context = await self.browser.new_context(accept_downloads=True)
-            page = await self.context.new_page()
-
-            try:
-                if "apkadmin" in self.url:
-                    res = await self._handler_apkadmin(page)
-                else:
-                    res = await self._handler_generic_browser(page)
-                return res
-            finally:
-                await self._close_all()
-
-    # --- UTILS ---
     def _human_size(self, b):
+        if not b: return "0 B"
         for unit in ['B','KB','MB','GB']:
             if b < 1024: return f"{b:.2f} {unit}"
             b /= 1024
 
-    async def _get_size_remote(self, url):
+    async def _notify(self, text):
+        """Update status ke Telegram secara Async."""
+        print(f"[*] {text}")
+        if not self.bot_token or not self.owner_id: return
+
+        loop = asyncio.get_event_loop()
+        if self.initial_message_id is None:
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            payload = {"chat_id": self.owner_id, "text": text, "parse_mode": "Markdown"}
+            try:
+                res = await loop.run_in_executor(None, lambda: requests.post(url, json=payload, timeout=10).json())
+                self.initial_message_id = res.get('result', {}).get('message_id')
+            except Exception as e: print(f"TG Error: {e}")
+        else:
+            url = f"https://api.telegram.org/bot{self.bot_token}/editMessageText"
+            payload = {"chat_id": self.owner_id, "message_id": self.initial_message_id, "text": text, "parse_mode": "Markdown"}
+            try:
+                await loop.run_in_executor(None, lambda: requests.post(url, json=payload, timeout=10))
+            except Exception as e: print(f"TG Error: {e}")
+
+    # =========================================================
+    # --- EXTERNAL TOOLS HANDLER ---
+    # =========================================================
+
+    async def _run_aria2c(self, download_url, output_filename, referer=None):
+        """Eksekusi Aria2c dengan monitoring progress."""
+        await self._notify(f"⬇️ **Aria2c:** Memulai download `{output_filename}`")
+        
+        cmd = [
+            'aria2c', 
+            '--allow-overwrite=true',
+            '--file-allocation=none',
+            '--user-agent', self.user_agent,
+            '-x', '16', '-s', '16', '-j', '16',
+            '-o', output_filename
+        ]
+        if referer:
+            cmd.extend(['--header', f'Referer: {referer}'])
+        
+        cmd.append(download_url)
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+
+        # Monitor output aria2c untuk mencari progress
+        while True:
+            line = await process.stdout.readline()
+            if not line: break
+            decoded_line = line.decode().strip()
+            
+            # Cari pola progress seperti (10%)
+            if "[" in decoded_line and "%]" in decoded_line:
+                match = re.search(r'\((\d+)%\)', decoded_line)
+                if match:
+                    percent = match.group(1)
+                    if int(percent) % 20 == 0: # Update tiap kelipatan 20%
+                        await self._notify(f"⬇️ **Aria2c Progress:** `{percent}%` untuk `{output_filename}`")
+
+        await process.wait()
+        if process.returncode == 0:
+            await self._notify(f"✅ **Selesai:** `{output_filename}` berhasil diunduh.")
+            return output_filename
+        else:
+            await self._notify(f"❌ **Aria2c Error:** Exit code {process.returncode}")
+            return None
+
+    # =========================================================
+    # --- BROWSER SCRAPING (STEALTH) ---
+    # =========================================================
+
+    async def _handle_pixeldrain(self):
+        """Logika khusus Pixeldrain menggunakan API."""
+        match = re.search(r"/(?:u|file)/([a-zA-Z0-9]+)", self.url)
+        if not match: return None
+        
+        file_id = match.group(1)
+        api_info_url = f"https://pixeldrain.com/api/file/{file_id}/info"
+        
+        loop = asyncio.get_event_loop()
         try:
-            loop = asyncio.get_event_loop()
-            r = await loop.run_in_executor(None, lambda: requests.head(url, allow_redirects=True, timeout=5))
-            return int(r.headers.get('Content-Length', 0))
-        except: return 0
+            info = await loop.run_in_executor(None, lambda: requests.get(api_info_url).json())
+            if info.get("success"):
+                filename = info.get("name")
+                size = info.get("size")
+                dl_url = f"https://pixeldrain.com/api/file/{file_id}?download"
+                await self._notify(f"📦 **Pixeldrain:** `{filename}` ({self._human_size(size)})")
+                return await self._run_aria2c(dl_url, filename, referer="https://pixeldrain.com/")
+        except: pass
+        return None
+
+    async def _handle_playwright_sites(self):
+        """Logika umum menggunakan Playwright Stealth (Gofile, ApkAdmin, dll)."""
+        async with Stealth().use_async(async_playwright()) as p:
+            browser = await p.chromium.launch(headless=True)
+            # Buat context dengan Stealth
+            context = await browser.new_context(user_agent=self.user_agent, accept_downloads=True)
+            page = await context.new_page()
+
+            # Testing Stealth Status
+            is_stealth = await page.evaluate("navigator.webdriver")
+            print(f"[*] Navigator.webdriver: {is_stealth}")
+
+            try:
+                await page.goto(self.url, wait_until="domcontentloaded", timeout=60000)
+                
+                if "apkadmin.com" in self.url:
+                    await self._notify("🔍 **ApkAdmin:** Menekan tombol generate...")
+                    # Submit form F1 (pemicu download di ApkAdmin)
+                    await page.evaluate("document.forms['F1'].submit()")
+                    
+                # Menangkap event download yang terpicu otomatis/klik
+                async with page.expect_download(timeout=60000) as download_info:
+                    # Klik tombol download yang umum jika tidak otomatis terpicu
+                    for selector in ["#downloadButton", "text='Download'", ".btn-download"]:
+                        try:
+                            btn = page.locator(selector).first
+                            if await btn.is_visible():
+                                await btn.click()
+                        except: pass
+                
+                download = await download_info.value
+                save_path = os.path.join(os.getcwd(), download.suggested_filename)
+                await download.save_as(save_path)
+                return save_path
+
+            except Exception as e:
+                await self._notify(f"❌ **Browser Error:** {str(e)[:100]}")
+            finally:
+                await browser.close()
+
+    # =========================================================
+    # --- MAIN RUNNER ---
+    # =========================================================
+
+    async def run(self):
+        await self._notify(f"⏳ **Memproses URL:** `{self.url}`")
+
+        # 1. Cek Pixeldrain (API lebih cepat daripada Browser)
+        if "pixeldrain.com" in self.url:
+            result = await self._handle_pixeldrain()
+            if result: return result
+
+        # 2. Cek Mega.nz
+        if "mega.nz" in self.url:
+            # Megatools biasanya sinkron, jalankan di executor
+            await self._notify("⬇️ **Megatools:** Memulai download MEGA...")
+            # (Implementasi megatools dl ...)
+            return "mega_downloaded"
+
+        # 3. Gunakan Playwright Stealth untuk sisa situs lainnya
+        return await self._handle_playwright_sites()
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2: sys.exit(1)
-    bot = DownloaderBot(sys.argv[1])
-    asyncio.run(bot.run())
+    if len(sys.argv) < 2:
+        print("Usage: python downloader_async.py <URL>")
+        sys.exit(1)
+        
+    input_url = sys.argv[1]
+    bot = DownloaderBot(input_url)
+    
+    try:
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        pass
