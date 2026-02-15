@@ -1,6 +1,7 @@
 pyrogram
 TgCrypto
 python-dotenv
+pyvirtualdisplay
 requests
 asyncio
 setuptools-scm
