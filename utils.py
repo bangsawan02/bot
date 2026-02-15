@@ -19,13 +19,11 @@ except Exception:
 
 
 async def apply_stealth(page):
-    if not stealth_async:
-        print("Stealth not available, skipping.")
-        return
-    try:
-        await stealth_async(page)
-    except Exception as e:
-        print("Stealth apply failed:", e)
+    if stealth_async:
+        try:
+            await stealth_async(page)
+        except Exception as e:
+            print("Stealth apply failed:", e)
 
 
 # ============================================================
@@ -39,7 +37,7 @@ def sanitize_filename(name: str) -> str:
 def extract_filename_from_cd(cd: str):
     if not cd:
         return None
-    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^\";]+)"?', cd, flags=re.IGNORECASE)
+    m = re.search(r'filename="?([^\";]+)"?', cd)
     return m.group(1) if m else None
 
 
@@ -128,8 +126,6 @@ class DownloaderBotAsync:
             if proc.returncode == 0 and os.path.exists(name):
                 return name
 
-            print("aria2c failed:", stderr.decode(errors="ignore"))
-
         # fallback requests
         try:
             await self._send_telegram(f"⬇️ Requests fallback: `{name}`")
@@ -147,20 +143,62 @@ class DownloaderBotAsync:
         return None
 
     # -------------------------
-    # Bruteforce + Sniffer
+    # APKADMIN 3-CLICK LOGIC
     # -------------------------
-    async def _bruteforce_once(self, page):
+    async def _apkadmin_clicks(self, page):
+        # 1) Free Download
+        btn1 = page.locator("text=/.*Free Download.*/i").first
+        if await btn1.is_visible():
+            await self._send_telegram("🔘 Klik 1: Free Download")
+            try:
+                await btn1.click()
+            except:
+                pass
+
+        await page.wait_for_timeout(5000)
+
+        # 2) Generate Link
+        btn2 = page.locator("text=/.*(Generate|Create|Get).*Link.*/i").first
+        if await btn2.is_visible():
+            await self._send_telegram("🔘 Klik 2: Generate Link")
+            try:
+                await btn2.click()
+            except:
+                pass
+
+        await page.wait_for_timeout(5000)
+
+        # 3) Click here to download
+        btn3 = page.locator("text=/.*Click here to download.*/i").first
+        if await btn3.is_visible():
+            await self._send_telegram("🔘 Klik 3: Click here to download")
+            try:
+                async with page.expect_download(timeout=15000) as d:
+                    await btn3.click()
+                download = await d.value
+                fname = download.suggested_filename or "downloaded_file"
+                await download.save_as(fname)
+                return fname
+            except:
+                pass
+
+        return None
+
+    # -------------------------
+    # Sniffer fallback
+    # -------------------------
+    async def _sniffer_fallback(self, page):
         sniffed = []
         last_headers = {}
 
         async def on_response(response):
             try:
                 url = response.url
-                headers = {k.lower(): v for k, v in response.headers.items()}
-                last_headers[url] = headers
-
                 if url.endswith(".js"):
                     return
+
+                headers = {k.lower(): v for k, v in response.headers.items()}
+                last_headers[url] = headers
 
                 ctype = (headers.get("content-type") or "").lower()
                 cd = (headers.get("content-disposition") or "").lower()
@@ -177,41 +215,8 @@ class DownloaderBotAsync:
 
         page.on("response", on_response)
 
-        # Klik tombol download
-        selectors = [
-            "text=/.*(Free Download|Download).*/i",
-            "a[href*='download']",
-            "button:has-text('Download')",
-            "a[href$='.apk']"
-        ]
+        await page.wait_for_timeout(3000)
 
-        for sel in selectors:
-            loc = page.locator(sel).first
-            if await loc.is_visible():
-                try:
-                    async with page.expect_download(timeout=8000) as d:
-                        await loc.click()
-                    download = await d.value
-                    fname = download.suggested_filename or "downloaded_file"
-                    await download.save_as(fname)
-                    return fname
-                except:
-                    pass
-
-        # Klik kedua (Generate Link)
-        second = page.locator("text=/.*(Generate|Create|Get).*Link.*/i").first
-        if await second.is_visible():
-            try:
-                async with page.expect_download(timeout=8000) as d:
-                    await second.click()
-                download = await d.value
-                fname = download.suggested_filename or "downloaded_file"
-                await download.save_as(fname)
-                return fname
-            except:
-                pass
-
-        # fallback sniffed
         if sniffed:
             target = sniffed[-1]
             headers = last_headers.get(target, {})
@@ -219,18 +224,6 @@ class DownloaderBotAsync:
             return await self._download_aria2(target, fname)
 
         return None
-
-    # -------------------------
-    # Bruteforce multi-attempt
-    # -------------------------
-    async def _bruteforce(self, page):
-        for attempt in range(1, 4):
-            await self._send_telegram(f"🔎 Attempt {attempt}/3...")
-            result = await self._bruteforce_once(page)
-            if result:
-                return result
-            await page.wait_for_timeout(2000)
-        raise Exception("Bruteforce gagal total setelah 3 percobaan.")
 
     # -------------------------
     # Browser runner
@@ -251,10 +244,17 @@ class DownloaderBotAsync:
             await page.goto(self.url, wait_until="domcontentloaded")
             await page.wait_for_timeout(2000)
 
-            try:
-                return await self._bruteforce(page)
-            finally:
-                await browser.close()
+            # 3 tahap klik
+            result = await self._apkadmin_clicks(page)
+            if result:
+                return result
+
+            # fallback sniff
+            result = await self._sniffer_fallback(page)
+            if result:
+                return result
+
+            raise Exception("Tidak menemukan file setelah 3 klik + sniff.")
 
     async def run(self):
         await self._send_telegram(f"🚀 Mulai: `{self.url}`")
