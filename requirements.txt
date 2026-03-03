@@ -6,6 +6,7 @@ requests
 asyncio
 setuptools-scm
 selenium-stealth
+selenium
 yt-dlp
 PyDrive
 google-api-python-client
