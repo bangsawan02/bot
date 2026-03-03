@@ -14,20 +14,22 @@ jobs:
       PAYLOAD_URL: ${{ github.event.client_payload.url }}
       PAYLOAD_SENDER: ${{ github.event.client_payload.sender }}
       PAYLOAD_MODE: ${{ github.event.client_payload.mode }}
+
       BOT_TOKEN: ${{ github.event.client_payload.bot_token }}
       GOOGLE_CLIENT_ID: ${{ github.event.client_payload.client_id }}
       GOOGLE_CLIENT_SECRET: ${{ github.event.client_payload.client_secret }}
       DRIVE_REFRESH_TOKEN: ${{ github.event.client_payload.refresh_token }}
+
       API_ID: ${{ vars.API_ID }}
       API_HASH: ${{ vars.API_HASH }}
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # =========================================================
-      # PYTHON SETUP & CACHE
-      # =========================================================
+# =========================================================
+# PYTHON SETUP
+# =========================================================
+
       - name: Set up Python
         id: setup-python
         uses: actions/setup-python@v5
@@ -35,65 +37,77 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      # =========================================================
-      # APT CACHE + DEPENDENCIES (XVFB & MEGATOOLS)
-      # =========================================================
-      - name: Restore APT Cache
+# =========================================================
+# APT CACHE + MEGATOOLS
+# =========================================================
+
+      - name: Grant permissions to APT cache
+        run: |
+          sudo chown -R $USER:$USER /var/cache/apt
+          sudo chown -R $USER:$USER /var/lib/apt
+
+      - name: Restore APT cache
+        if: contains(env.PAYLOAD_URL, 'mega.nz')
+        id: restore-apt
         uses: actions/cache/restore@v3
-        id: apt-cache
         with:
           path: |
             /var/cache/apt/archives
             /var/lib/apt/lists
-          key: ${{ runner.os }}-apt-v1-${{ hashFiles('**/main.py') }} # Menggunakan hash file sebagai trigger refresh
-          restore-keys: ${{ runner.os }}-apt-v1-
+          key: ${{ runner.os }}-apt-megatools
+          restore-keys: |
+            ${{ runner.os }}-apt-
 
-      - name: Install System Dependencies
+      - name: Install megatools
+        if: contains(env.PAYLOAD_URL, 'mega.nz')
         run: |
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb
-          if [[ "${{ env.PAYLOAD_URL }}" == *"mega.nz"* ]]; then
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends megatools
-          fi
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y megatools
 
-      # =========================================================
-      # VENV & PLAYWRIGHT CACHE
-      # =========================================================
-      - name: Restore Venv & Playwright Cache
-        id: restore-cache
-        uses: actions/cache/restore@v3
+      - name: Save APT cache (Always)
+        if: always() && contains(env.PAYLOAD_URL, 'mega.nz')
+        uses: actions/cache/save@v3
         with:
           path: |
-            .venv
-            ~/.cache/ms-playwright
-          key: ${{ runner.os }}-venv-playwright-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-venv-playwright-
+            /var/cache/apt/archives
+            /var/lib/apt/lists
+          key: ${{ runner.os }}-apt-megatools
 
-      - name: Setup Python Environment & Playwright
+# =========================================================
+# OPTIONAL YOUTUBE COOKIES
+# =========================================================
+
+    
+# =========================================================
+# VENV CACHE
+# =========================================================
+
+      - name: Restore Venv Cache
+        id: restore-venv
+        uses: actions/cache/restore@v3
+        with:
+          path: .venv
+          key: ${{ runner.os }}-venv-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-venv-${{ steps.setup-python.outputs.python-version }}-
+            ${{ runner.os }}-venv-
+
+      - name: Setup Dependencies
         run: |
           python -m venv .venv
+          echo ".venv/bin" >> $GITHUB_PATH
           source .venv/bin/activate
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> $GITHUB_PATH
-          
           python -m pip install --upgrade pip
-          
-          # Install requirements jika cache tidak sempurna
-          if [ "${{ steps.restore-cache.outputs.cache-hit }}" != "true" ]; then
+          if [ "${{ steps.restore-venv.outputs.cache-hit }}" != "true" ]; then
             pip install -r requirements.txt
-            playwright install chromium --with-deps
-          else
-            # Jika cache hit, pastikan OS deps untuk playwright tetap terinstall (sangat cepat)
-            playwright install-deps chromium
           fi
 
-      # =========================================================
-      # EXECUTION (DOWNLOAD)
-      # =========================================================
+# =========================================================
+# DOWNLOAD
+# =========================================================
+
       - name: Run Downloader Script
-        run: |
-          sudo rm -f /tmp/.X99-lock
-          sudo rm -f /tmp/.X11-unix/X99
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" python main.py
+        run: python main.py
         env:
           OWNER_ID: ${{ env.PAYLOAD_SENDER }}
           MEDIAFIRE_PAGE_URL: ${{ env.PAYLOAD_URL }}
@@ -110,9 +124,10 @@ jobs:
             echo "file_name=unknown" >> $GITHUB_OUTPUT
           fi
 
-      # =========================================================
-      # UPLOAD SECTION
-      # =========================================================
+# =========================================================
+# UPLOAD SECTION
+# =========================================================
+
       - name: Upload to Telegram
         if: env.PAYLOAD_MODE == 'telegram'
         run: python telegram_upload.py
@@ -129,28 +144,18 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ env.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ env.GOOGLE_CLIENT_SECRET }}
 
-      # =========================================================
-      # SAVE CACHES (ALWAYS)
-      # =========================================================
-      - name: Save Caches
-        if: always() && steps.restore-cache.outputs.cache-hit != 'true'
+# =========================================================
+# SAVE CACHE + CLEANUP (ALWAYS)
+# =========================================================
+
+      - name: Save Venv Cache (Always)
+        if: always() && steps.restore-venv.outputs.cache-hit != 'true'
         uses: actions/cache/save@v3
         with:
-          path: |
-            .venv
-            ~/.cache/ms-playwright
-          key: ${{ runner.os }}-venv-playwright-${{ hashFiles('requirements.txt') }}
+          path: .venv
+          key: ${{ runner.os }}-venv-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('requirements.txt') }}
 
-      - name: Save APT Cache
-        if: always() && steps.apt-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v3
-        with:
-          path: |
-            /var/cache/apt/archives
-            /var/lib/apt/lists
-          key: ${{ runner.os }}-apt-v1-${{ hashFiles('**/main.py') }}
-
-      - name: Cleanup
+      - name: Clean APT leftover
         if: always()
         run: |
           sudo rm -rf /var/cache/apt/archives/partial
