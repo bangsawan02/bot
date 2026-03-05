@@ -1,25 +1,12 @@
 {
   "name": "gofile-bot-nodejs",
   "version": "1.0.0",
-  "description": "Automated Downloader using Playwright and Node.js",
   "main": "main.js",
-  "scripts": {
-    "start": "node main.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [
-    "playwright",
-    "downloader",
-    "automation",
-    "gofile",
-    "mediafire"
-  ],
-  "author": "Gemini-Bot",
-  "license": "ISC",
   "dependencies": {
     "axios": "*",
     "fs-extra": "*",
     "playwright": "*",
-    "playwright-stealth": "*"
+    "playwright-extra": "*",
+    "stealth-plugin": "*"
   }
 }
