@@ -1,18 +1,15 @@
-// Ganti require yang lama dengan ini:
 const { chromium } = require('playwright-extra');
-const stealth = require('stealth-plugin')();
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 
-// Tambahkan plugin stealth ke engine playwright
-chromium.use(stealth);
+// Pasang plugin stealth sebelum engine digunakan
+chromium.use(StealthPlugin());
 
-// Sisanya sama, tapi saat launch browser gunakan chromium dari playwright-extra
 const axios = require('axios');
 const fs = require('fs-extra');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 const { URL } = require('url');
-const querystring = require('querystring');
 
 // =========================================================
 // CLASS UTAMA: DownloaderBot
@@ -77,7 +74,7 @@ class DownloaderBot {
                 text: text,
                 parse_mode: "Markdown"
             });
-        } catch (e) { /* ignore edit errors to prevent spam logs */ }
+        } catch (e) { /* ignore edit errors */ }
     }
 
     async _getTotalFileSizeSafe(url) {
@@ -94,7 +91,7 @@ class DownloaderBot {
             const cdHeader = res.headers['content-disposition'];
             if (cdHeader) {
                 const match = cdHeader.match(/filename\*?=["']?(?:utf-8'')?([^"';]+)["']?/i);
-                if (match) return match[1].trim().replace(/[^\x00-\x7F]/g, ""); // strip non-ascii
+                if (match) return match[1].trim().replace(/[^\x00-\x7F]/g, ""); 
             }
         } catch (e) {}
         
@@ -198,12 +195,12 @@ class DownloaderBot {
     }
 
     // =========================================================
-    // 3. PLAYWRIGHT (Pengganti Selenium)
+    // 3. PLAYWRIGHT (Engine Utama)
     // =========================================================
     async _initializeBrowser() {
         try {
             this.browser = await chromium.launch({
-                headless: false, // Karena pakai xvfb
+                headless: false, // Ubah ke true untuk GitHub Actions
                 args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
             });
             
@@ -221,31 +218,27 @@ class DownloaderBot {
 
     async _processPlaywrightDownload() {
         const page = await this.context.newPage();
-        //await stealth().onPageCreated(page); // Terapkan Stealth
         await page.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
         await this._editTelegramMessage(`⬇️ **[Mode Download]** Menganalisis situs...`);
 
         let downloadedFilename = null;
 
         try {
-            if (this.url.includes("mediafire")) {
+            if (this.url.includes("mediafire.com")) {
                 await this._editTelegramMessage("⬇️ **[MediaFire Mode]** Ekstrak URL...");
-                // Bypass form 1 jika ada, atau langsung cari tombol download
                 const dlButton = page.locator('#downloadButton');
                 await dlButton.waitFor({ state: 'visible', timeout: 30000 });
                 
                 const finalUrl = await dlButton.getAttribute('href');
                 const fileName = await this._extractFilename(finalUrl);
-                
                 downloadedFilename = await this._downloadFileWithAria2c([finalUrl], fileName);
 
-            } else if (this.url.includes("gofile")) {
+            } else if (this.url.includes("gofile.io")) {
                 await this._editTelegramMessage("⬇️ **[Gofile Mode]** Mengklik tombol download...");
                 
-                // Monitor request untuk cari direct link atau handle download event
                 const downloadPromise = page.waitForEvent('download', { timeout: 120000 });
                 
-                // Klik paksa karena Gofile sering ubah selector
+                // Klik tombol download secara agresif di Gofile
                 await page.evaluate(() => {
                     const btns = Array.from(document.querySelectorAll('button, a'));
                     const dlBtn = btns.find(b => b.textContent.toLowerCase().includes('download') || b.id.includes('download'));
@@ -297,7 +290,7 @@ class DownloaderBot {
             if (this.url.includes("mega.nz")) {
                 finalFilename = await this._downloadFileWithMegatools(this.url);
             } 
-            else if (this.url.includes("pixeldrain")) {
+            else if (this.url.includes("pixeldrain.com")) {
                 const match = this.url.match(/pixeldrain\.com\/(u|l|f)\/([a-zA-Z0-9]+)/);
                 if (!match) throw new Error("URL Pixeldrain tidak valid.");
                 const fileId = match[2];
@@ -311,14 +304,10 @@ class DownloaderBot {
             else {
                 const isBrowserInit = await this._initializeBrowser();
                 if (!isBrowserInit) throw new Error("Gagal init Playwright.");
-                
-                // Untuk sourceforge & apkadmin bisa dihandle mirip mediafire (ekstrak link -> aria2c)
-                // Sementara fallback ke Playwright download event
                 finalFilename = await this._processPlaywrightDownload();
             }
 
             if (finalFilename) {
-                // Tulis nama file agar bisa dibaca YAML step berikutnya
                 fs.writeFileSync('downloaded_filename.txt', finalFilename);
                 console.log(`[OK] File berhasil diunduh: ${finalFilename}`);
             }
