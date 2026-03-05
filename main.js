@@ -1,5 +1,11 @@
-const { chromium } = require('playwright');
-const { stealth } = require('playwright-stealth');
+// Ganti require yang lama dengan ini:
+const { chromium } = require('playwright-extra');
+const stealth = require('stealth-plugin')();
+
+// Tambahkan plugin stealth ke engine playwright
+chromium.use(stealth);
+
+// Sisanya sama, tapi saat launch browser gunakan chromium dari playwright-extra
 const axios = require('axios');
 const fs = require('fs-extra');
 const path = require('path');
@@ -215,7 +221,7 @@ class DownloaderBot {
 
     async _processPlaywrightDownload() {
         const page = await this.context.newPage();
-        await stealth().onPageCreated(page); // Terapkan Stealth
+        //await stealth().onPageCreated(page); // Terapkan Stealth
         await page.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
         await this._editTelegramMessage(`⬇️ **[Mode Download]** Menganalisis situs...`);
 
