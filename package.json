@@ -2,11 +2,13 @@
   "name": "gofile-bot-nodejs",
   "version": "1.0.0",
   "main": "main.js",
+  
   "dependencies": {
     "axios": "*",
     "fs-extra": "*",
     "playwright": "*",
     "playwright-extra": "*",
-    "stealth-plugin": "*"
-  }
+    "puppeteer-extra-plugin-stealth": "*"
+  
+}
 }
