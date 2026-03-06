@@ -27,13 +27,10 @@ class DownloaderBot {
                     .map(s => s.trim())
                     .filter(s => s.length > 0);
             }
-        } catch (e) {
-            console.error("Gagal baca selector.txt");
-        }
+        } catch (e) {}
         return [];
     }
 
-    // --- TELEGRAM HELPERS ---
     async _sendTelegramMessage(text) {
         if (!this.botToken || !this.ownerId) return;
         try {
@@ -79,11 +76,9 @@ class DownloaderBot {
         return (bytes / Math.pow(1024, i)).toFixed(2) + " " + ["B", "KB", "MB", "GB"][i];
     }
 
-    // --- DOWNLOAD HANDLER ---
     async _handleDownload(download) {
         const filename = download.suggestedFilename();
         const savePath = path.join(process.cwd(), filename);
-        
         let totalSize = null;
         try {
             const head = await axios.head(download.url(), { timeout: 8000 });
@@ -91,7 +86,6 @@ class DownloaderBot {
         } catch (e) {}
 
         await this._editTelegramMessage(`⬇️ **Downloading:** \`${filename}\``);
-
         let lastPercent = -10;
         const timer = setInterval(async () => {
             if (fs.existsSync(savePath) && totalSize) {
@@ -110,7 +104,6 @@ class DownloaderBot {
         return filename;
     }
 
-    // --- CORE LOGIC ---
     async _processDefault() {
         const page = await this.context.newPage();
         page.setDefaultNavigationTimeout(60000);
@@ -119,29 +112,29 @@ class DownloaderBot {
             await this._editTelegramMessage(`🔎 Menuju URL (Percobaan ${attempt}/2)...`);
             await page.goto(this.url, { waitUntil: 'networkidle', timeout: 60000 });
 
-            // Pantau download selama seluruh sequence klik berjalan
             const downloadPromise = page.waitForEvent('download', { timeout: 60000 }).catch(() => null);
 
             for (const selector of this.selectors) {
                 try {
                     const btn = page.locator(selector).first();
-                    if (await btn.isVisible({ timeout: 10000 })) {
-                        await this._editTelegramMessage(`🎯 Menekan: \`${selector}\``);
-                        
-                        // Klik dan tunggu navigasi/refresh selesai
-                        await Promise.all([
-                            page.waitForLoadState('networkidle').catch(() => null),
-                            btn.click()
-                        ]);
-                        
-                        // Jeda singkat agar data/selector baru muncul sempurna
-                        await page.waitForTimeout(3000);
-                        
-                        // Cek apakah download terpancing setelah klik ini
-                        // (Beberapa web butuh 1 klik, ada yang 2 klik)
-                    }
+                    
+                    // JANGAN cuma cek visible, cek apakah dia ada di HTML (attached)
+                    await btn.waitFor({ state: 'attached', timeout: 5000 });
+
+                    // Maksa scroll ke lokasi tombol
+                    await btn.scrollIntoViewIfNeeded().catch(() => null);
+
+                    await this._editTelegramMessage(`🎯 Mencoba klik: \`${selector}\``);
+                    
+                    // FORCE CLICK: Klik koordinat elemen tanpa peduli terhalang iklan/tidak visible
+                    await Promise.all([
+                        page.waitForLoadState('networkidle').catch(() => null),
+                        btn.click({ force: true, timeout: 5000 })
+                    ]);
+                    
+                    await page.waitForTimeout(4000); 
                 } catch (e) {
-                    console.log(`Selector ${selector} tidak terlihat, lanjut...`);
+                    console.log(`[Console] Selector ${selector} gagal dieksekusi: ${e.message}`);
                 }
             }
 
@@ -149,40 +142,29 @@ class DownloaderBot {
             if (download) return await this._handleDownload(download);
 
             if (attempt === 2) {
-                await this._sendScreenshot(page, `❌ Gagal: Semua selector telah dicoba tapi download tidak muncul.`);
+                await this._sendScreenshot(page, `❌ Gagal: Selector ditemukan di kode tapi klik tidak memicu download.`);
             }
         }
-        throw new Error("Download gagal setelah 2x sequence.");
+        throw new Error("Download gagal.");
     }
 
     async run() {
         await this._sendTelegramMessage(`⏳ **Memproses:** \`${this.url}\``);
         let finalFile = null;
-
         try {
             if (this.url.includes("mega.nz")) {
-                await this._editTelegramMessage("⬇️ **MEGA Mode...**");
                 finalFile = await new Promise((res, rej) => {
                     const mega = spawn('megatools', ['dl', this.url]);
                     mega.on('close', (code) => {
                         const files = fs.readdirSync('.').filter(f => !['main.js', 'selector.txt', 'package.json'].includes(f) && !f.endsWith('.png'));
-                        code === 0 ? res(files[0]) : rej(new Error("MegaTools error"));
+                        code === 0 ? res(files[0]) : rej(new Error("Mega Error"));
                     });
                 });
-            } else if (this.url.includes("pixeldrain.com")) {
-                const id = this.url.split('/').pop();
-                const info = await axios.get(`https://pixeldrain.com/api/file/${id}/info`);
-                finalFile = info.data.name;
-                await new Promise((res, rej) => {
-                    spawn('aria2c', ['-x16', '-s16', '-o', finalFile, `https://pixeldrain.com/api/file/${id}?download`])
-                        .on('close', (c) => c === 0 ? res() : rej());
-                });
             } else {
-                this.browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+                this.browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
                 this.context = await this.browser.newContext({ acceptDownloads: true });
                 finalFile = await this._processDefault();
             }
-
             if (finalFile) fs.writeFileSync('downloaded_filename.txt', finalFile);
         } catch (e) {
             await this._editTelegramMessage(`❌ **Error:** ${e.message}`);
