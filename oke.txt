@@ -1,5 +1,0 @@
-pyrogram
-python-dotenv
-tgcrypto
-requests
-flask
