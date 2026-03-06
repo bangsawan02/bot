@@ -27,10 +27,11 @@ class DownloaderBot {
                     .map(s => s.trim())
                     .filter(s => s.length > 0);
             }
-        } catch (e) {}
-        return [];
+        } catch (e) { console.log("Selector.txt tidak ditemukan, menggunakan fallback."); }
+        return ['a[href*="download"]', 'button:has-text("Download")', '.download-btn'];
     }
 
+    // --- TELEGRAM LOGIC ---
     async _sendTelegramMessage(text) {
         if (!this.botToken || !this.ownerId) return;
         try {
@@ -57,7 +58,7 @@ class DownloaderBot {
 
     async _sendScreenshot(page, caption) {
         try {
-            const screenshotPath = 'debug.png';
+            const screenshotPath = 'debug_fail.png';
             await page.screenshot({ path: screenshotPath, fullPage: true });
             const form = new FormData();
             form.append('chat_id', this.ownerId);
@@ -67,7 +68,7 @@ class DownloaderBot {
                 headers: form.getHeaders()
             });
             fs.removeSync(screenshotPath);
-        } catch (e) {}
+        } catch (e) { console.error("Gagal kirim screenshot:", e.message); }
     }
 
     _humanReadableSize(bytes) {
@@ -76,34 +77,34 @@ class DownloaderBot {
         return (bytes / Math.pow(1024, i)).toFixed(2) + " " + ["B", "KB", "MB", "GB"][i];
     }
 
-    async _handleDownload(download) {
+    // --- DOWNLOAD ENGINES ---
+    async _downloadWithAria2(url, filename = "") {
+        await this._editTelegramMessage(`🚀 **Aria2c Engine:** Mendownload direct link...`);
+        return new Promise((resolve, reject) => {
+            const args = ['-x', '16', '-s', '16', '--summary-interval=0', '--console-log-level=warn', url];
+            if (filename) args.push('-o', filename);
+            
+            const aria = spawn('aria2c', args);
+            aria.on('close', (code) => {
+                if (code === 0) {
+                    const files = fs.readdirSync('.').filter(f => !['main.js', 'selector.txt', 'package.json'].includes(f) && !f.endsWith('.png'));
+                    // Ambil file terbaru yang bukan script
+                    const sortedFiles = files.map(f => ({ name: f, time: fs.statSync(f).mtime })).sort((a, b) => b.time - a.time);
+                    resolve(sortedFiles[0].name);
+                } else reject(new Error(`Aria2 Error Code: ${code}`));
+            });
+        });
+    }
+
+    async _handlePlaywrightDownload(download) {
         const filename = download.suggestedFilename();
         const savePath = path.join(process.cwd(), filename);
-        let totalSize = null;
-        try {
-            const head = await axios.head(download.url(), { timeout: 8000 });
-            totalSize = parseInt(head.headers['content-length']);
-        } catch (e) {}
-
-        await this._editTelegramMessage(`⬇️ **Downloading:** \`${filename}\``);
-        let lastPercent = -10;
-        const timer = setInterval(async () => {
-            if (fs.existsSync(savePath) && totalSize) {
-                const stats = fs.statSync(savePath);
-                const percent = Math.floor((stats.size / totalSize) * 100);
-                if (percent >= lastPercent + 10 && percent <= 100) {
-                    lastPercent = percent;
-                    await this._editTelegramMessage(`⬇️ **Progress:** \`${percent}%\` (\`${this._humanReadableSize(stats.size)}\` / \`${this._humanReadableSize(totalSize)}\`)`);
-                }
-            }
-        }, 4000);
-
+        await this._editTelegramMessage(`⬇️ **Playwright Engine:** Menyimpan \`${filename}\`...`);
         await download.saveAs(savePath);
-        clearInterval(timer);
-        await this._editTelegramMessage(`✅ **Selesai:** \`${filename}\` (\`${this._humanReadableSize(fs.statSync(savePath).size)}\`)`);
         return filename;
     }
 
+    // --- MAIN BROWSER PROCESS ---
     async _processDefault() {
         const page = await this.context.newPage();
         page.setDefaultNavigationTimeout(60000);
@@ -112,52 +113,58 @@ class DownloaderBot {
             await this._editTelegramMessage(`🔎 Menuju URL (Percobaan ${attempt}/2)...`);
             await page.goto(this.url, { waitUntil: 'networkidle', timeout: 60000 });
 
-            const downloadPromise = page.waitForEvent('download', { timeout: 60000 }).catch(() => null);
+            // Pantau download selama interaksi
+            const downloadPromise = page.waitForEvent('download', { timeout: 45000 }).catch(() => null);
 
             for (const selector of this.selectors) {
                 try {
                     const btn = page.locator(selector).first();
-                    
-                    // JANGAN cuma cek visible, cek apakah dia ada di HTML (attached)
-                    await btn.waitFor({ state: 'attached', timeout: 5000 });
+                    await btn.waitFor({ state: 'attached', timeout: 8000 });
 
-                    // Maksa scroll ke lokasi tombol
+                    // 1. CEK APAKAH ADA HREF (DIRECT LINK)
+                    const href = await btn.getAttribute('href');
+                    if (href && href.startsWith('http') && !href.includes('javascript:')) {
+                        await this._editTelegramMessage(`🔗 Direct Link terdeteksi pada \`${selector}\`.`);
+                        return await this._downloadWithAria2(href);
+                    }
+
+                    // 2. JIKA TIDAK ADA HREF, PAKSA KLIK
                     await btn.scrollIntoViewIfNeeded().catch(() => null);
-
-                    await this._editTelegramMessage(`🎯 Mencoba klik: \`${selector}\``);
+                    await this._editTelegramMessage(`🎯 Menekan: \`${selector}\`...`);
                     
-                    // FORCE CLICK: Klik koordinat elemen tanpa peduli terhalang iklan/tidak visible
                     await Promise.all([
                         page.waitForLoadState('networkidle').catch(() => null),
-                        btn.click({ force: true, timeout: 5000 })
+                        btn.click({ force: true })
                     ]);
                     
-                    await page.waitForTimeout(4000); 
+                    await page.waitForTimeout(4000); // Jeda refresh/render
                 } catch (e) {
-                    console.log(`[Console] Selector ${selector} gagal dieksekusi: ${e.message}`);
+                    console.log(`[Log] ${selector} tidak siap/tidak ada.`);
                 }
             }
 
             const download = await downloadPromise;
-            if (download) return await this._handleDownload(download);
+            if (download) return await this._handlePlaywrightDownload(download);
 
             if (attempt === 2) {
-                await this._sendScreenshot(page, `❌ Gagal: Selector ditemukan di kode tapi klik tidak memicu download.`);
+                await this._sendScreenshot(page, `❌ Gagal: Download tidak terpancing setelah semua klik.`);
             }
         }
-        throw new Error("Download gagal.");
+        throw new Error("Gagal mendapatkan file setelah 2x percobaan.");
     }
 
     async run() {
-        await this._sendTelegramMessage(`⏳ **Memproses:** \`${this.url}\``);
+        await this._sendTelegramMessage(`⏳ **Target:** \`${this.url}\``);
         let finalFile = null;
+
         try {
             if (this.url.includes("mega.nz")) {
+                await this._editTelegramMessage("⬇️ **MEGA Engine Active...**");
                 finalFile = await new Promise((res, rej) => {
                     const mega = spawn('megatools', ['dl', this.url]);
-                    mega.on('close', (code) => {
-                        const files = fs.readdirSync('.').filter(f => !['main.js', 'selector.txt', 'package.json'].includes(f) && !f.endsWith('.png'));
-                        code === 0 ? res(files[0]) : rej(new Error("Mega Error"));
+                    mega.on('close', (c) => {
+                        const files = fs.readdirSync('.').filter(f => !['main.js', 'selector.txt', 'package.json'].includes(f));
+                        c === 0 ? res(files[0]) : rej(new Error("Megatools Gagal."));
                     });
                 });
             } else {
@@ -165,7 +172,12 @@ class DownloaderBot {
                 this.context = await this.browser.newContext({ acceptDownloads: true });
                 finalFile = await this._processDefault();
             }
-            if (finalFile) fs.writeFileSync('downloaded_filename.txt', finalFile);
+
+            if (finalFile) {
+                const stats = fs.statSync(finalFile);
+                fs.writeFileSync('downloaded_filename.txt', finalFile);
+                await this._editTelegramMessage(`✅ **Selesai!**\n📄 File: \`${finalFile}\`\n⚖️ Size: \`${this._humanReadableSize(stats.size)}\``);
+            }
         } catch (e) {
             await this._editTelegramMessage(`❌ **Error:** ${e.message}`);
             process.exit(1);
