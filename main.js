@@ -1,7 +1,5 @@
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-
-// Pasang plugin stealth agar tidak terdeteksi bot
 chromium.use(StealthPlugin());
 
 const axios = require('axios');
@@ -10,9 +8,6 @@ const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 
-// =========================================================
-// CLASS UTAMA: DownloaderBot
-// =========================================================
 class DownloaderBot {
     constructor(url) {
         this.url = url;
@@ -24,7 +19,6 @@ class DownloaderBot {
         this.selectors = this._loadSelectors();
     }
 
-    // Mengambil daftar selector dari file eksternal
     _loadSelectors() {
         try {
             if (fs.existsSync('selector.txt')) {
@@ -33,15 +27,10 @@ class DownloaderBot {
                     .map(s => s.trim())
                     .filter(s => s.length > 0);
             }
-        } catch (e) {
-            console.error("Gagal membaca selector.txt:", e.message);
-        }
-        return ['#downloadButton', '.download-btn', 'a[href*="download"]']; // Default fallback
+        } catch (e) { console.error("Gagal baca selector.txt:", e.message); }
+        return ['#downloadButton', '.download-btn', 'a[href*="download"]'];
     }
 
-    // =========================================================
-    // 1. TELEGRAM HELPER
-    // =========================================================
     _humanReadableSize(sizeBytes) {
         if (!sizeBytes || sizeBytes === 0) return "0B";
         const units = ["B", "KB", "MB", "GB", "TB"];
@@ -73,111 +62,114 @@ class DownloaderBot {
         } catch (e) {}
     }
 
-    // =========================================================
-    // 2. LOGIKA DOWNLOAD KHUSUS (MEGA & PIXELDRAIN)
-    // =========================================================
-    async _downloadWithAria2(url, filename) {
-        return new Promise((resolve, reject) => {
-            const args = ['-x', '16', '-s', '16', '-o', filename, url];
-            const aria = spawn('aria2c', args);
-            aria.on('close', (code) => code === 0 ? resolve(filename) : reject(`Aria2 error ${code}`));
-        });
-    }
-
-    async _downloadWithMega(url) {
-        return new Promise((resolve, reject) => {
-            const mega = spawn('megatools', ['dl', url]);
-            mega.on('close', (code) => {
-                if (code === 0) {
-                    const files = fs.readdirSync('.').filter(f => !f.endsWith('.json') && f !== 'main.js');
-                    resolve(files[0]);
-                } else reject(`Mega error ${code}`);
-            });
-        });
-    }
-
-    // =========================================================
-    // 3. LOGIKA DEFAULT DOWNLOADER (PLAYWRIGHT)
-    // =========================================================
     async _initializeBrowser() {
         try {
-            this.browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+            this.browser = await chromium.launch({ 
+                headless: true, 
+                args: ['--no-sandbox', '--disable-setuid-sandbox'] 
+            });
             this.context = await this.browser.newContext({ acceptDownloads: true });
             return true;
         } catch (e) { return false; }
     }
 
+    async _handleDownloadProgress(download) {
+        const filename = download.suggestedFilename();
+        const savePath = path.join(process.cwd(), filename);
+        
+        let totalSize = null;
+        try {
+            // Coba ambil ukuran file dari HEAD request
+            const head = await axios.head(download.url(), { timeout: 8000 });
+            totalSize = parseInt(head.headers['content-length']);
+        } catch (e) { console.log("Info: Total size tidak ditemukan via HEAD"); }
+
+        await this._editTelegramMessage(`⬇️ **Download Dimulai:** \`${filename}\``);
+
+        let lastPercent = -10; // Trigger update pertama kali
+        const progressTimer = setInterval(async () => {
+            if (fs.existsSync(savePath) && totalSize) {
+                const stats = fs.statSync(savePath);
+                const percent = Math.floor((stats.size / totalSize) * 100);
+
+                // Update tiap naik 10% agar tidak kena spam-limit Telegram
+                if (percent >= lastPercent + 10 && percent <= 100) {
+                    lastPercent = percent;
+                    const loaded = this._humanReadableSize(stats.size);
+                    const total = this._humanReadableSize(totalSize);
+                    await this._editTelegramMessage(`⬇️ **Downloading:** \`${filename}\`\n📊 **Progress:** \`${percent}%\` (\`${loaded}\` / \`${total}\`)`);
+                }
+            }
+        }, 4000);
+
+        try {
+            await download.saveAs(savePath);
+            clearInterval(progressTimer);
+            const finalStats = fs.statSync(savePath);
+            await this._editTelegramMessage(`✅ **Selesai!**\nFile: \`${filename}\` (\`${this._humanReadableSize(finalStats.size)}\`)`);
+            return filename;
+        } catch (err) {
+            clearInterval(progressTimer);
+            throw err;
+        }
+    }
+
     async _processDefaultDownload() {
         const page = await this.context.newPage();
-        await this._editTelegramMessage(`🔎 Menuju: ${this.url}`);
         await page.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-        let downloadedFile = null;
-
-        // Loop maksimal 3 percobaan jika terjadi redirect
         for (let attempt = 1; attempt <= 3; attempt++) {
             await this._editTelegramMessage(`📡 Mencari tombol... (Percobaan ${attempt}/3)`);
-
-            // Listener untuk menangkap event download
             const downloadPromise = page.waitForEvent('download', { timeout: 30000 }).catch(() => null);
 
-            let clickSuccess = false;
+            let clicked = false;
             for (const selector of this.selectors) {
                 try {
                     const btn = page.locator(selector).first();
                     if (await btn.isVisible({ timeout: 3000 })) {
-                        await this._editTelegramMessage(`🎯 Klik: \`${selector}\``);
                         await btn.click();
-                        clickSuccess = true;
+                        clicked = true;
                         break;
                     }
                 } catch (e) {}
             }
 
             const download = await downloadPromise;
-            if (download) {
-                const filename = download.suggestedFilename();
-                const savePath = path.join(process.cwd(), filename);
-                await this._editTelegramMessage(`⬇️ Mendownload: \`${filename}\`...`);
-                await download.saveAs(savePath);
-                downloadedFile = filename;
-                break;
-            }
-
-            if (!clickSuccess) {
-                await page.waitForTimeout(5000); // Tunggu sebentar jika page loading/redirect
-            }
+            if (download) return await this._handleDownloadProgress(download);
+            if (!clicked) await page.waitForTimeout(5000);
         }
-
-        if (!downloadedFile) throw new Error("Gagal: File tidak ditemukan/terdownload.");
-        return downloadedFile;
+        throw new Error("Gagal: Tidak ada download terdeteksi.");
     }
 
-    // =========================================================
-    // 4. MAIN RUNNER
-    // =========================================================
     async run() {
-        await this._sendTelegramMessage(`⏳ **Memproses URL...**`);
+        await this._sendTelegramMessage(`⏳ **Memproses:** \`${this.url}\``);
         let finalFile = null;
 
         try {
             if (this.url.includes("mega.nz")) {
-                finalFile = await this._downloadWithMega(this.url);
+                await this._editTelegramMessage("⬇️ **MEGA Mode...**");
+                finalFile = await new Promise((res, rej) => {
+                    const mega = spawn('megatools', ['dl', this.url]);
+                    mega.on('close', (code) => {
+                        if (code === 0) {
+                            const files = fs.readdirSync('.').filter(f => !f.endsWith('.js') && !f.endsWith('.txt') && !f.endsWith('.json'));
+                            res(files[0]);
+                        } else rej(new Error("Megatools gagal"));
+                    });
+                });
             } else if (this.url.includes("pixeldrain.com")) {
                 const id = this.url.split('/').pop();
                 const info = await axios.get(`https://pixeldrain.com/api/file/${id}/info`);
-                finalFile = await this._downloadWithAria2(`https://pixeldrain.com/api/file/${id}?download`, info.data.name);
+                finalFile = info.data.name;
+                const args = ['-x', '16', '-s', '16', '-o', finalFile, `https://pixeldrain.com/api/file/${id}?download`];
+                await new Promise((res, rej) => {
+                    spawn('aria2c', args).on('close', (c) => c === 0 ? res() : rej());
+                });
             } else {
-                if (await this._initializeBrowser()) {
-                    finalFile = await this._processDefaultDownload();
-                }
+                if (await this._initializeBrowser()) finalFile = await this._processDefaultDownload();
             }
 
-            if (finalFile) {
-                const size = this._humanReadableSize(fs.statSync(finalFile).size);
-                await this._editTelegramMessage(`✅ **Selesai!**\nFile: \`${finalFile}\`\nSize: \`${size}\``);
-                fs.writeFileSync('downloaded_filename.txt', finalFile);
-            }
+            if (finalFile) fs.writeFileSync('downloaded_filename.txt', finalFile);
         } catch (e) {
             await this._editTelegramMessage(`❌ **Error:** ${e.message}`);
             process.exit(1);
@@ -187,10 +179,5 @@ class DownloaderBot {
     }
 }
 
-// Eksekusi
-const targetUrl = process.env.PAYLOAD_URL || process.argv[2];
-if (targetUrl) {
-    new DownloaderBot(targetUrl).run();
-} else {
-    console.error("URL tidak ditemukan!");
-}
+const target = process.env.PAYLOAD_URL || process.argv[2];
+if (target) new DownloaderBot(target).run();
