@@ -1,9 +1,0 @@
-mediafire
-#downloadButton
-
-gofile
-#filemanager_itemslist > div:nth-child(7) > div > div:nth-child(2) > div > button
-
-apkadmin
-#downloadbtn
-#container > div.download-file.step-2 > div.a-spot.text-align-center > div > a > img
