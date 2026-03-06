@@ -7,6 +7,10 @@ on:
 jobs:
   download-and-release:
     runs-on: ubuntu-latest
+    # MENGGUNAKAN DOCKER: Semua dependensi browser sudah ada di sini
+    container:
+      image: mcr.microsoft.com/playwright:v1.42.1-jammy 
+    
     permissions:
       contents: write
 
@@ -25,36 +29,33 @@ jobs:
         uses: actions/checkout@v4
 
       # =========================================================
-      # 1. RESTORE CACHE SECTION (Hanya Mengambil)
+      # 1. RESTORE CACHE
       # =========================================================
-      - name: Restore Node & Playwright Cache
+      - name: Restore Node Cache
         uses: actions/cache/restore@v4
         with:
-          path: |
-            node_modules
-            ~/.cache/ms-playwright
-          key: ${{ runner.os }}-node-v1-${{ hashFiles('package.json') }}
+          path: node_modules
+          key: ${{ runner.os }}-node-v2-${{ hashFiles('package.json') }}
           restore-keys: |
-            ${{ runner.os }}-node-v1-
+            ${{ runner.os }}-node-v2-
 
       - name: Restore Pip Cache
         uses: actions/cache/restore@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-v1-${{ hashFiles('requirements.txt') }}
+          key: ${{ runner.os }}-pip-v2-${{ hashFiles('requirements.txt') }}
           restore-keys: |
-            ${{ runner.os }}-pip-v1-
+            ${{ runner.os }}-pip-v2-
 
       # =========================================================
-      # 2. INSTALLATION
+      # 2. INSTALLATION (Jauh lebih cepat karena lib OS sudah ada)
       # =========================================================
-      - name: Install Node Dependencies
+      - name: Install Dependencies
         run: |
           npm install
-          npx playwright install chromium --with-deps
-
-      - name: Install Python Dependencies
-        run: |
+          # Di Docker, kita hanya perlu mastiin binari browser ada tanpa --with-deps
+          npx playwright install chromium
+          
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
@@ -62,12 +63,10 @@ jobs:
             pip install requests google-api-python-client google-auth-httplib2 google-auth-oauthlib
           fi
 
-      - name: Install System Tools
+      - name: Install Megatools (Hanya jika perlu)
         run: |
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb
           if [[ "${{ env.PAYLOAD_URL }}" == *"mega.nz"* ]]; then
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends megatools
+            apt-get update && apt-get install -y megatools aria2
           fi
 
       # =========================================================
@@ -75,9 +74,8 @@ jobs:
       # =========================================================
       - name: Run Node.js Downloader
         run: |
-          sudo rm -f /tmp/.X99-lock
-          sudo rm -f /tmp/.X11-unix/X99
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" node main.js
+          # Di Docker Playwright, kita tidak butuh xvfb manual karena sudah dihandle
+          node main.js
         env:
           PAYLOAD_URL: ${{ env.PAYLOAD_URL }}
           BOT_TOKEN: ${{ env.BOT_TOKEN }}
@@ -99,26 +97,24 @@ jobs:
           if [[ "${{ env.PAYLOAD_MODE }}" == "telegram" ]]; then
             python telegram_upload.py
           else
-            python upld.py
+            python upad.py
           fi
         env:
           FILENAME: ${{ steps.get_filename.outputs.file_name }}
 
       # =========================================================
-      # 4. FORCE SAVE CACHE (Berjalan meski step di atas Error/Cancel)
+      # 4. FORCE SAVE CACHE (Selalu simpan meski error)
       # =========================================================
-      - name: Save Node & Playwright Cache
+      - name: Save Node Cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: |
-            node_modules
-            ~/.cache/ms-playwright
-          key: ${{ runner.os }}-node-v1-${{ hashFiles('package.json') }}
+          path: node_modules
+          key: ${{ runner.os }}-node-v2-${{ hashFiles('package.json') }}
 
       - name: Save Pip Cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-v1-${{ hashFiles('requirements.txt') }}
+          key: ${{ runner.os }}-pip-v2-${{ hashFiles('requirements.txt') }}
