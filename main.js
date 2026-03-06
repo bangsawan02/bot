@@ -22,14 +22,19 @@ class DownloaderBot {
     _loadSelectorsByDomain() {
         try {
             const data = fs.readJsonSync('selectors.json');
-            const urlObj = new URL(this.url);
-            const domain = urlObj.hostname.replace('www.', '');
-            return data[domain] || data['default'];
+            const domain = new URL(this.url).hostname.replace('www.', '');
+            
+            // Ambil selector berdasarkan domain, kalau gak ada pake default
+            const selected = data[domain] || data['default'];
+            console.log(`[Config] Menggunakan selector untuk: ${domain}`);
+            return selected;
         } catch (e) {
+            console.log("[Error] Gagal baca selectors.json, pake fallback.");
             return ["a:has-text('Download')", "#downloadButton", "#downloadbtn"];
         }
     }
 
+    // --- TELEGRAM LOGIC ---
     async _sendTelegramMessage(text) {
         if (!this.botToken || !this.ownerId) return;
         try {
@@ -62,13 +67,14 @@ class DownloaderBot {
         } catch (e) {}
     }
 
+    // --- DOWNLOAD ENGINE ---
     async _downloadWithAria2(url) {
-        await this._editTelegramMessage(`🚀 **Aria2c:** Sikat link langsung...`);
+        await this._editTelegramMessage(`🚀 **Aria2c Engine:** Mendownload via Direct Link...`);
         return new Promise((resolve, reject) => {
             const aria = spawn('aria2c', ['-x16', '-s16', '--summary-interval=0', url]);
             aria.on('close', (c) => {
                 if (c === 0) {
-                    const files = fs.readdirSync('.').filter(f => !['main.js', 'selectors.json', 'package.json'].includes(f) && !f.endsWith('.png') && !f.endsWith('.txt'));
+                    const files = fs.readdirSync('.').filter(f => !['main.js', 'selectors.json', 'package.json'].includes(f) && !f.endsWith('.png'));
                     const sorted = files.map(f => ({ n: f, t: fs.statSync(f).mtime })).sort((a, b) => b.t - a.t);
                     resolve(sorted[0].n);
                 } else reject(new Error("Aria2 gagal"));
@@ -79,10 +85,10 @@ class DownloaderBot {
     async _processDefault() {
         const page = await this.context.newPage();
         
-        // Block ads/popups agar tidak mengganggu klik
+        // Block ads agar tidak timeout
         await page.route('**/*', (route) => {
             const url = route.request().url();
-            if (['google-analytics', 'doubleclick', 'adskeeper', 'popads', 'onclick'].some(d => url.includes(d))) return route.abort();
+            if (['google-analytics', 'doubleclick', 'adsystem', 'adskeeper', 'popads'].some(d => url.includes(d))) return route.abort();
             route.continue();
         });
 
@@ -90,33 +96,25 @@ class DownloaderBot {
             await this._editTelegramMessage(`🔎 Navigasi (Percobaan ${attempt}/2)...`);
             try {
                 await page.goto(this.url, { waitUntil: 'load', timeout: 60000 });
-                
-                // Pantau download event
+                await page.waitForTimeout(3000);
+
                 const downloadPromise = page.waitForEvent('download', { timeout: 60000 }).catch(() => null);
 
                 for (const selector of this.selectors) {
                     try {
-                        await this._editTelegramMessage(`⏳ Menunggu tombol: \`${selector}\`...`);
-                        
-                        // TUNGGU SAMPAI TOMBOL MUNCUL (PENTING!)
                         const btn = page.locator(selector).first();
-                        await btn.waitFor({ state: 'attached', timeout: 15000 }); 
+                        await btn.waitFor({ state: 'attached', timeout: 7000 });
 
-                        // Cek HREF jika direct link
                         const href = await btn.getAttribute('href');
                         if (href && href.startsWith('http') && !href.includes('javascript:')) {
                             return await this._downloadWithAria2(href);
                         }
 
-                        // Jika bukan link, Klik paksa
+                        await this._editTelegramMessage(`🎯 Klik Paksa: \`${selector}\``);
                         await btn.scrollIntoViewIfNeeded().catch(() => null);
                         await btn.click({ force: true });
-                        
-                        // Jeda setelah klik untuk refresh/generate link baru
-                        await page.waitForTimeout(5000); 
-                    } catch (e) {
-                        console.log(`[Log] Selector ${selector} tidak muncul dalam 15 detik.`);
-                    }
+                        await page.waitForTimeout(5000);
+                    } catch (e) { console.log(`[Log] Skip ${selector}`); }
                 }
 
                 const download = await downloadPromise;
@@ -125,23 +123,20 @@ class DownloaderBot {
                     await download.saveAs(filename);
                     return filename;
                 }
-            } catch (e) {
-                console.log(`Error di attempt ${attempt}: ${e.message}`);
-                if (attempt === 2) await this._sendScreenshot(page, "Gagal total setelah 2 percobaan.");
-            }
+            } catch (e) { if (attempt === 2) await this._sendScreenshot(page, "Timeout Navigasi"); }
         }
-        throw new Error("Proses Berhenti: File tidak ditemukan.");
+        throw new Error("Gagal mendapatkan download.");
     }
 
     async run() {
-        await this._sendTelegramMessage(`⏳ **Bot Memulai...**`);
+        await this._sendTelegramMessage(`⏳ **Bot Working...**`);
         try {
-            this.browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+            this.browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
             this.context = await this.browser.newContext({ acceptDownloads: true });
             const finalFile = await this._processDefault();
             if (finalFile) {
                 fs.writeFileSync('downloaded_filename.txt', finalFile);
-                await this._editTelegramMessage(`✅ **Berhasil:** \`${finalFile}\``);
+                await this._editTelegramMessage(`✅ **Selesai:** \`${finalFile}\``);
             }
         } catch (e) {
             await this._editTelegramMessage(`❌ **Error:** ${e.message}`);
