@@ -6,4 +6,4 @@ gofile
 
 apkadmin
 #downloadbtn
-#container > div.download-file.step-2 > div.a-spot.text-align-center > div > a
+#container > div.download-file.step-2 > div.a-spot.text-align-center > div > a > img
