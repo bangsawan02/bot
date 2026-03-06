@@ -11,8 +11,7 @@
   ],
   "apkadmin.com": [
     "#downloadbtn",
-    "#container > div.download-file.step-2 > div.a-spot.text-align-center > div > a",
-    "a:has-text('Start Download')"
+    "a[href^='https://udl']"
   ],
   "default": [
     "a[href*='download']",
