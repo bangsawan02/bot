@@ -7,114 +7,59 @@ on:
 jobs:
   download-and-release:
     runs-on: ubuntu-latest
-    # MENGGUNAKAN DOCKER: Semua dependensi browser sudah ada di sini
-    container:
-      image: mcr.microsoft.com/playwright:v1.42.1-jammy 
     
     permissions:
       contents: write
 
     env:
       PAYLOAD_URL: ${{ github.event.client_payload.url }}
-      PAYLOAD_SENDER: ${{ github.event.client_payload.sender }}
-      PAYLOAD_MODE: ${{ github.event.client_payload.mode }}
       BOT_TOKEN: ${{ github.event.client_payload.bot_token }}
-      GOOGLE_CLIENT_ID: ${{ github.event.client_payload.client_id }}
-      GOOGLE_CLIENT_SECRET: ${{ github.event.client_payload.client_secret }}
-      DRIVE_REFRESH_TOKEN: ${{ github.event.client_payload.refresh_token }}
       OWNER_ID: ${{ github.event.client_payload.sender }}
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # =========================================================
-      # 1. RESTORE CACHE
-      # =========================================================
-      - name: Restore Node Cache
+      # 1. RESTORE CACHE (Ambil folder modules & browser)
+      - name: Restore Node & Playwright Cache
         uses: actions/cache/restore@v4
         with:
-          path: node_modules
-          key: ${{ runner.os }}-node-v2-${{ hashFiles('package.json') }}
+          path: |
+            node_modules
+            ~/.cache/ms-playwright
+          key: ${{ runner.os }}-node-v5-${{ hashFiles('package.json') }}
           restore-keys: |
-            ${{ runner.os }}-node-v2-
+            ${{ runner.os }}-node-v5-
 
-      - name: Restore Pip Cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-v2-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-v2-
-
-      # =========================================================
-      # 2. INSTALLATION (Jauh lebih cepat karena lib OS sudah ada)
-      # =========================================================
+      # 2. INSTALLATION (Akan sangat cepat jika cache hit)
       - name: Install Dependencies
         run: |
           npm install
-          # Di Docker, kita hanya perlu mastiin binari browser ada tanpa --with-deps
+          # Install browser tanpa --with-deps (biasanya lib dasar sudah ada di ubuntu-latest)
           npx playwright install chromium
           
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install requests google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          # Install megatools & aria2 hanya jika dibutuhkan (kondisional)
+          if [[ "${{ env.PAYLOAD_URL }}" == *"mega.nz"* || "${{ env.PAYLOAD_URL }}" == *"pixeldrain"* ]]; then
+            sudo apt-get update && sudo apt-get install -y megatools aria2
           fi
 
-      - name: Install Megatools (Hanya jika perlu)
-        run: |
-          if [[ "${{ env.PAYLOAD_URL }}" == *"mega.nz"* ]]; then
-            apt-get update && apt-get install -y megatools aria2
-          fi
-
-      # =========================================================
       # 3. EXECUTION
-      # =========================================================
-      - name: Run Node.js Downloader
+      - name: Run Downloader
         run: |
-          # Di Docker Playwright, kita tidak butuh xvfb manual karena sudah dihandle
-          node main.js
+          # Install xvfb secara instan untuk headles mode browser
+          sudo apt-get install -y xvfb
+          xvfb-run --auto-servernum node main.js
         env:
           PAYLOAD_URL: ${{ env.PAYLOAD_URL }}
           BOT_TOKEN: ${{ env.BOT_TOKEN }}
           OWNER_ID: ${{ env.OWNER_ID }}
 
-      - name: Get Downloaded Filename
-        id: get_filename
-        run: |
-          if [ -f "downloaded_filename.txt" ]; then
-            FILE_NAME=$(cat downloaded_filename.txt | tr -d '\n')
-          else
-            FILE_NAME=$(ls -p | grep -v / | grep -vE '\.(js|py|json|yaml|yml|txt|md|lock)$' | head -1)
-          fi
-          echo "file_name=$FILE_NAME" >> $GITHUB_OUTPUT
-
-      - name: Upload logic
-        if: steps.get_filename.outputs.file_name != ''
-        run: |
-          if [[ "${{ env.PAYLOAD_MODE }}" == "telegram" ]]; then
-            python telegram_upload.py
-          else
-            python upad.py
-          fi
-        env:
-          FILENAME: ${{ steps.get_filename.outputs.file_name }}
-
-      # =========================================================
-      # 4. FORCE SAVE CACHE (Selalu simpan meski error)
-      # =========================================================
-      - name: Save Node Cache
+      # 4. SAVE CACHE (Selalu simpan meski error/cancel)
+      - name: Save Node & Playwright Cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: node_modules
-          key: ${{ runner.os }}-node-v2-${{ hashFiles('package.json') }}
-
-      - name: Save Pip Cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-v2-${{ hashFiles('requirements.txt') }}
+          path: |
+            node_modules
+            ~/.cache/ms-playwright
+          key: ${{ runner.os }}-node-v5-${{ hashFiles('package.json') }}
