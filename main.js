@@ -50,30 +50,37 @@ async function downloadSourceForge(targetUrl) {
         const finalUrls = mirrorIds.slice(0, 10).map(id => `${cleanUrl}?use_mirror=${id}`);
 
         // 5. Jalankan Aria2c
+// 5. Jalankan Aria2c dengan penanganan header yang lebih ketat
         console.log(`🚀 Downloading: ${fileName}`);
+        
         const aria2Args = [
-            '-x16', '-s16', '-j16', '-k1M',
+            '--console-log-level=warn',
+            '-x16', 
+            '-s16', 
+            '-j16', 
+            '-k1M',
             '--file-allocation=none',
+            '--check-certificate=false',
+            '--retry-wait=5',
+            '--max-tries=10',
             `--user-agent=${USER_AGENT}`,
-            `--header=Referer: ${mirrorPageUrl}`,
+            `--header=Referer: https://sourceforge.net/`,
+            `--header=Accept: */*`,
             '-o', fileName,
-            ...finalUrls
+            // Bungkus setiap URL dengan tanda kutip untuk keamanan
+            ...finalUrls 
         ];
 
-        const aria2 = spawn('aria2c', aria2Args);
-
-        aria2.stdout.on('data', (data) => {
-            if (data.toString().includes('%')) {
-                process.stdout.write(`\r${data.toString().trim()}`);
-            }
-        });
+        // Gunakan stdio: 'inherit' agar kita bisa lihat error asli dari aria2c di log GitHub
+        const aria2 = spawn('aria2c', aria2Args, { stdio: ['ignore', 'inherit', 'inherit'] });
 
         aria2.on('close', (code) => {
             if (code === 0) {
                 console.log(`\n✨ Selesai: ${fileName}`);
                 fs.writeFileSync('downloaded_filename.txt', fileName);
             } else {
-                console.error("\n❌ Aria2c gagal.");
+                console.error(`\n❌ Aria2c gagal dengan exit code: ${code}`);
+                // Cek apakah file parsial ada, jika ya mungkin masalah disk atau koneksi putus
                 process.exit(1);
             }
         });
