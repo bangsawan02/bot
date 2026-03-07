@@ -1,75 +1,234 @@
+const { chromium, devices } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+chromium.use(StealthPlugin());
+
 const axios = require('axios');
-const { spawn } = require('child_process');
 const fs = require('fs-extra');
+const { spawn } = require('child_process');
+const FormData = require('form-data');
 
-// --- CONFIG ---
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const OWNER_ID = process.env.OWNER_ID;
-const URL_TARGET = process.env.PAYLOAD_URL;
+class DownloaderBot {
+    constructor(url) {
+        this.url = url;
+        this.botToken = process.env.BOT_TOKEN;
+        this.ownerId = process.env.OWNER_ID;
+        this.initialMessageId = null;
+        this.browser = null;
+        this.context = null;
+        this.selectors = this._loadSelectorsByDomain();
+    }
 
-async function notify(text) {
-    console.log(text);
-    if (!BOT_TOKEN || !OWNER_ID) return;
-    await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        chat_id: OWNER_ID, text: text, parse_mode: "Markdown"
-    }).catch(() => {});
-}
-
-async function solveSourceForge() {
-    try {
-        await notify("📡 **Mencoba Taktik API Bypass (No Browser)...**");
-
-        // 1. Ekstrak Project Name & Path dari URL
-        // Contoh: https://sourceforge.net/projects/blissos-x86/files/Official/BlissOS14/.../download
-        const urlObj = new URL(URL_TARGET);
-        const parts = urlObj.pathname.split('/');
-        const projectName = parts[2];
-        // Ambil path di antara '/files/' dan '/download'
-        const fileIndex = parts.indexOf('files');
-        const downloadIndex = parts.indexOf('download');
-        const filePath = parts.slice(fileIndex + 1, downloadIndex).join('/');
-
-        await notify(`📦 Project: \`${projectName}\`\n📁 Path: \`${filePath}\``);
-
-        // 2. Tembak API SourceForge langsung (Seringkali tidak ada Cloudflare di sini)
-        // Kita minta daftar mirror dalam format JSON
-        const apiUrl = `https://sourceforge.net/settings/mirror_choices?projectname=${projectName}&filename=${filePath}&format=json`;
-        
-        const response = await axios.get(apiUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'application/json'
+    _loadSelectorsByDomain() {
+        try {
+            if (fs.existsSync('selectors.json')) {
+                const data = fs.readJsonSync('selectors.json');
+                const domain = new URL(this.url).hostname.replace('www.', '');
+                return data[domain] || data['default'];
             }
+        } catch (e) {
+            console.log("Gagal load selectors.json, menggunakan default.");
+        }
+        return ["a[href^='http']", "form", "button:has-text('Download')"];
+    }
+
+    _humanSize(bytes) {
+        if (!bytes || bytes === 0) return "0 B";
+        const i = Math.floor(Math.log(bytes) / Math.log(1024));
+        return (bytes / Math.pow(1024, i)).toFixed(2) + " " + ["B", "KB", "MB", "GB"][i];
+    }
+
+    // --- TELEGRAM HELPERS ---
+    async _sendTelegramMessage(text) {
+        if (!this.botToken || !this.ownerId) return;
+        try {
+            const res = await axios.post(`https://api.telegram.org/bot${this.botToken}/sendMessage`, {
+                chat_id: this.ownerId, text, parse_mode: "Markdown"
+            });
+            this.initialMessageId = res.data.result.message_id;
+        } catch (e) { console.error("Telegram Error:", e.message); }
+    }
+
+    async _editTelegramMessage(text) {
+        if (!this.initialMessageId) return await this._sendTelegramMessage(text);
+        try {
+            await axios.post(`https://api.telegram.org/bot${this.botToken}/editMessageText`, {
+                chat_id: this.ownerId, message_id: this.initialMessageId, text, parse_mode: "Markdown"
+            }).catch(() => {});
+        } catch (e) {}
+    }
+
+    async _sendScreenshot(caption) {
+        if (!this.context || !this.botToken) return;
+        try {
+            const pages = this.context.pages();
+            const page = pages[pages.length - 1];
+            if (!page) return;
+
+            const screenshotPath = 'error_debug.png';
+            await page.screenshot({ path: screenshotPath, fullPage: true });
+            
+            const form = new FormData();
+            form.append('chat_id', this.ownerId);
+            form.append('caption', caption);
+            form.append('photo', fs.createReadStream(screenshotPath));
+            
+            await axios.post(`https://api.telegram.org/bot${this.botToken}/sendPhoto`, form, { headers: form.getHeaders() });
+            fs.removeSync(screenshotPath);
+        } catch (e) { console.log("Gagal kirim screenshot:", e.message); }
+    }
+
+    // --- PYTHON DELEGATION ENGINE ---
+    async _runPythonSourceForge() {
+        await this._sendTelegramMessage(`🐍 **SourceForge Detected**\nMenjalankan \`main.py\` untuk bypass Cloudflare...`);
+        
+        return new Promise((resolve, reject) => {
+            const py = spawn('python3', ['main.py', this.url], {
+                env: { ...process.env, PYTHONUNBUFFERED: '1' }
+            });
+
+            py.stdout.on('data', (data) => {
+                const out = data.toString();
+                console.log(`[Python]: ${out}`);
+                if (out.includes('%')) { // Update progress jika ada persen
+                    this._editTelegramMessage(`🐍 **Python Progress:**\n\`${out.trim()}\``);
+                }
+            });
+
+            py.stderr.on('data', (data) => console.error(`[Python Error]: ${data}`));
+
+            py.on('close', (code) => {
+                if (code === 0) resolve(true);
+                else reject(new Error(`Python exit code: ${code}`));
+            });
+        });
+    }
+
+    // --- ARIA2C ENGINE ---
+    async _downloadWithAria2(url) {
+        if (!url) return null;
+        await this._editTelegramMessage(`🚀 **Aria2c:** Menarik file...`);
+        
+        return new Promise((resolve, reject) => {
+            const aria = spawn('aria2c', [
+                '-x16', '-s16', '--summary-interval=3', '--file-allocation=none', '--auto-file-renaming=false', url
+            ]);
+
+            let lastUpdate = 0;
+            let fileName = "Mengidentifikasi...";
+
+            aria.stdout.on('data', async (data) => {
+                const output = data.toString();
+                const nameMatch = output.match(/Saving to: .*\/(.+)/) || output.match(/Saving to: (.+)/);
+                if (nameMatch && fileName === "Mengidentifikasi...") {
+                    fileName = nameMatch[1].trim();
+                }
+
+                const progressMatch = output.match(/\((.*)%\).*DL:(.*)\]/);
+                if (progressMatch) {
+                    const now = Date.now();
+                    if (now - lastUpdate > 4000) {
+                        lastUpdate = now;
+                        await this._editTelegramMessage(`⬇️ **Aria2c Progress**\n\n📄 File: \`${fileName}\`\n📊 Progress: \`${progressMatch[1]}%\`\n⚡ Speed: \`${progressMatch[2]}\``);
+                    }
+                }
+            });
+
+            aria.on('close', (code) => {
+                if (code === 0) {
+                    const files = fs.readdirSync('.').filter(f => 
+                        !['main.js', 'main.py', 'selectors.json', 'package.json'].includes(f) && 
+                        !f.endsWith('.png') && !f.endsWith('.aria2')
+                    );
+                    const sorted = files.map(f => ({ n: f, t: fs.statSync(f).mtime })).sort((a, b) => b.t - a.t);
+                    resolve(sorted.length > 0 ? sorted[0].n : null);
+                } else reject(new Error(`Aria2 error code: ${code}`));
+            });
+        });
+    }
+
+    // --- PLAYWRIGHT LOGIC (FOR NON-SF) ---
+    async _processDefault() {
+        let currentPage = await this.context.newPage();
+        
+        await this.context.route('**/*', (route) => {
+            if (['analytics', 'adskeeper', 'popads', 'doubleclick'].some(d => route.request().url().includes(d))) return route.abort();
+            route.continue();
         });
 
-        const mirrors = response.data.mirrors;
-        if (!mirrors || mirrors.length === 0) throw new Error("API tidak mengembalikan daftar mirror.");
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            await this._editTelegramMessage(`🔎 Percobaan ${attempt}/2: Memindai (Playwright)...`);
+            const downloadPromise = this.context.waitForEvent('download', { timeout: 45000 }).catch(() => null);
 
-        // 3. Ambil 5 mirror terbaik
-        const topMirrors = mirrors.slice(0, 5).map(m => {
-            return `https://${m.shortname}.dl.sourceforge.net/project/${projectName}/${filePath}`;
-        });
+            try {
+                await currentPage.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                await currentPage.waitForTimeout(3000);
 
-        await notify(`✅ Berhasil dapat ${topMirrors.length} mirror via API.`);
+                let actionDone = false;
+                for (const selector of this.selectors) {
+                    try {
+                        const el = currentPage.locator(selector).first();
+                        await el.waitFor({ state: 'attached', timeout: 5000 });
+                        
+                        const tag = await el.evaluate(e => e.tagName.toLowerCase());
+                        if (tag === 'form') {
+                            await el.evaluate(f => f.submit());
+                            actionDone = true;
+                        } else {
+                            const href = await el.getAttribute('href');
+                            if (href && href.startsWith('http') && !href.includes('javascript:')) {
+                                return await this._downloadWithAria2(href);
+                            }
+                            await el.click({ force: true });
+                            actionDone = true;
+                        }
+                        if (actionDone) break;
+                    } catch (e) { continue; }
+                }
 
-        // 4. Hajar pakai Aria2c
-        const fileName = filePath.split('/').pop();
-        await download(topMirrors, fileName);
+                const dlObj = await downloadPromise;
+                if (dlObj) {
+                    const directUrl = dlObj.url();
+                    await dlObj.cancel();
+                    return await this._downloadWithAria2(directUrl);
+                }
+            } catch (e) { console.log(`Attempt ${attempt} gagal.`); }
+        }
+        throw new Error("Gagal: Link download tidak ditemukan.");
+    }
 
-    } catch (e) {
-        await notify(`❌ **Taktik API Gagal:** ${e.message}\nSitus ini benar-benar memblokir IP GitHub.`);
+    async run() {
+        // PERCABANGAN LOGIKA
+        if (this.url.includes('sourceforge.net')) {
+            try {
+                await this._runPythonSourceForge();
+                return; 
+            } catch (e) {
+                await this._editTelegramMessage(`❌ Python Engine Gagal: ${e.message}. Mencoba Playwright...`);
+            }
+        }
+
+        // DEFAULT ENGINE
+        await this._sendTelegramMessage(`⏳ **Bot Start (Playwright Mode)...**`);
+        try {
+            this.browser = await chromium.launch({ headless: false, args: ['--no-sandbox'] });
+            this.context = await this.browser.newContext({ ...devices['iPhone 13'], acceptDownloads: true });
+            
+            const finalFile = await this._processDefault();
+            
+            if (finalFile) {
+                const size = fs.statSync(finalFile).size;
+                fs.writeFileSync('downloaded_filename.txt', finalFile);
+                await this._editTelegramMessage(`✅ **Selesai!**\n📄 File: \`${finalFile}\`\n⚖️ Size: \`${this._humanSize(size)}\``);
+            }
+        } catch (e) {
+            await this._editTelegramMessage(`❌ **Error:** ${e.message}`);
+            await this._sendScreenshot(`Debug Error`);
+            process.exit(1);
+        } finally {
+            if (this.browser) await this.browser.close();
+        }
     }
 }
 
-async function download(urls, fileName) {
-    await notify(`⬇️ Memulai Aria2c untuk \`${fileName}\`...`);
-    const args = ['-x16', '-s16', '-j16', '-k1M', '--file-allocation=none', '-o', fileName, ...urls];
-    
-    const aria = spawn('aria2c', args);
-    aria.on('close', (code) => {
-        if (code === 0) notify(`🎉 **FINISH!** File \`${fileName}\` siap di-upload.`);
-        else notify(`💀 Aria2c gagal (Code: ${code})`);
-    });
-}
-
-solveSourceForge();
+const target = process.env.PAYLOAD_URL || process.argv[2];
+if (target) new DownloaderBot(target).run();
