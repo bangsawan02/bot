@@ -10,7 +10,7 @@
     "i.fa-download"
   ],
   "apkadmin.com": [
-    "#downloadbtn",
+    "form[name='F1']",
     "a[href^='https://udl']"
   ],
   "default": [
