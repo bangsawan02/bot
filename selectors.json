@@ -13,7 +13,7 @@
     "form[name='F1']",
     "a[href^='https://udl']"
   ],
-  "sourceforge": [
+  "sourceforge.net": [
     "#remaining-buttons > div.large-12 > a.button.green"
   ],
   "default": [
