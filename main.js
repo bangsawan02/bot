@@ -25,7 +25,7 @@ class DownloaderBot {
             const domain = new URL(this.url).hostname.replace('www.', '');
             return data[domain] || data['default'];
         } catch (e) {
-            return ["a[href^='http']", "form", "button:has-text('Download')"];
+            return ["a[href^='http']", "form", "button:has-text('Download')", "a:has-text('Start Download')"];
         }
     }
 
@@ -35,7 +35,7 @@ class DownloaderBot {
         return (bytes / Math.pow(1024, i)).toFixed(2) + " " + ["B", "KB", "MB", "GB"][i];
     }
 
-    // --- TELEGRAM HELPERS ---
+    // --- TELEGRAM LOGIC ---
     async _sendTelegramMessage(text) {
         if (!this.botToken || !this.ownerId) return;
         try {
@@ -56,149 +56,143 @@ class DownloaderBot {
     }
 
     async _sendScreenshot(caption) {
-        if (!this.context || !this.botToken) return;
+        if (!this.context) return;
         try {
             const pages = this.context.pages();
-            const page = pages[pages.length - 1]; // Ambil tab terakhir yang aktif
-            if (!page) return;
-
-            const screenshotPath = 'error_debug.png';
-            await page.screenshot({ path: screenshotPath, fullPage: true });
-            
+            const page = pages[pages.length - 1] || pages[0];
+            const screenshotPath = 'debug.png';
+            await page.screenshot({ path: screenshotPath });
             const form = new FormData();
             form.append('chat_id', this.ownerId);
             form.append('caption', caption);
             form.append('photo', fs.createReadStream(screenshotPath));
-            
             await axios.post(`https://api.telegram.org/bot${this.botToken}/sendPhoto`, form, { headers: form.getHeaders() });
             fs.removeSync(screenshotPath);
-        } catch (e) {
-            console.log("Gagal kirim screenshot:", e.message);
-        }
+        } catch (e) {}
     }
 
     // --- ARIA2C ENGINE ---
     async _downloadWithAria2(url) {
-        if (!url) return null;
-        await this._editTelegramMessage(`🚀 **Aria2c:** Menarik file...`);
-        
+        await this._editTelegramMessage(`🚀 **Aria2c Engine:** Sikat!`);
         return new Promise((resolve, reject) => {
             const aria = spawn('aria2c', [
-                '-x16', '-s16', '--summary-interval=3', '--console-log-level=notice',
+                '-x16', '-s16', '--summary-interval=4', 
                 '--file-allocation=none', '--auto-file-renaming=false', url
             ]);
 
             let lastUpdate = 0;
-            let fileName = "Mengidentifikasi...";
+            let fileName = "Menganalisa...";
 
             aria.stdout.on('data', async (data) => {
                 const output = data.toString();
                 const nameMatch = output.match(/Saving to: .*\/(.+)/) || output.match(/Saving to: (.+)/);
-                if (nameMatch && (fileName === "Mengidentifikasi..." || !fileName)) {
-                    fileName = nameMatch[1].trim();
-                }
+                if (nameMatch && (fileName === "Menganalisa..." || !fileName)) fileName = nameMatch[1].trim();
 
                 const progressMatch = output.match(/\((.*)%\).*DL:(.*)\]/);
                 if (progressMatch) {
-                    const percent = progressMatch[1];
-                    const speed = progressMatch[2];
                     const now = Date.now();
-                    if (now - lastUpdate > 4000) {
+                    if (now - lastUpdate > 5000) {
                         lastUpdate = now;
-                        await this._editTelegramMessage(`⬇️ **Aria2c Progress**\n\n📄 File: \`${fileName}\`\n📊 Progress: \`${percent}%\`\n⚡ Speed: \`${speed}\``);
+                        await this._editTelegramMessage(`⬇️ **Aria2c Progress**\n\n📄 File: \`${fileName}\`\n📊 Status: \`${progressMatch[1]}%\`\n⚡ Speed: \`${progressMatch[2]}\``);
                     }
                 }
             });
 
             aria.on('close', (code) => {
                 if (code === 0) {
-                    const files = fs.readdirSync('.').filter(f => 
-                        !['main.js', 'selectors.json', 'package.json'].includes(f) && 
-                        !f.endsWith('.png') && !f.endsWith('.aria2')
-                    );
-                    if (files.length === 0) return reject(new Error("File tidak ditemukan!"));
+                    const files = fs.readdirSync('.').filter(f => !['main.js', 'selectors.json', 'package.json'].includes(f) && !f.endsWith('.png') && !f.endsWith('.aria2'));
                     const sorted = files.map(f => ({ n: f, t: fs.statSync(f).mtime })).sort((a, b) => b.t - a.t);
                     resolve(sorted[0].n);
-                } else reject(new Error(`Aria2 error code: ${code}`));
+                } else reject(new Error(`Aria2 failed code ${code}`));
             });
         });
     }
 
-    // --- LOGIKA UTAMA ---
+    // --- MAIN PROCESS ---
     async _processDefault() {
-        let currentPage = await this.context.newPage();
+        let page = await this.context.newPage();
         
-        await this.context.route('**/*', (route) => {
-            if (['analytics', 'adskeeper', 'popads', 'doubleclick'].some(d => route.request().url().includes(d))) return route.abort();
-            route.continue();
-        });
-
         for (let attempt = 1; attempt <= 2; attempt++) {
-            await this._editTelegramMessage(`🔎 Percobaan ${attempt}/2: Memindai (Mobile Mode)...`);
-            const downloadPromise = this.context.waitForEvent('download', { timeout: 45000 }).catch(() => null);
+            await this._editTelegramMessage(`🔎 Percobaan ${attempt}/2 (Bypass Mode)...`);
+            const downloadPromise = this.context.waitForEvent('download', { timeout: 60000 }).catch(() => null);
 
             try {
-                await currentPage.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-                await currentPage.waitForTimeout(3000);
+                await page.goto(this.url, { waitUntil: 'networkidle', timeout: 90000 });
 
+                // --- BYPASS CLOUDFLARE TURNSTILE ---
+                const cfIframe = page.locator('iframe[src*="challenges"]');
+                if (await cfIframe.count() > 0) {
+                    await this._editTelegramMessage(`🛡️ Cloudflare Terdeteksi! Menunggu verifikasi otomatis...`);
+                    await page.waitForTimeout(10000); 
+                    // Blind click ke arah checkbox biasanya
+                    await page.mouse.click(150, 150).catch(() => {}); 
+                }
+
+                // Cek apakah halaman berubah (redirect)
+                await page.waitForTimeout(5000);
                 const pages = this.context.pages();
-                currentPage = pages[pages.length - 1]; 
+                page = pages[pages.length - 1];
 
                 let actionDone = false;
                 for (const selector of this.selectors) {
-                    try {
-                        const el = currentPage.locator(selector).first();
-                        await el.waitFor({ state: 'attached', timeout: 5000 });
-
-                        const tag = await el.evaluate(e => e.tagName.toLowerCase());
+                    const btn = page.locator(selector).first();
+                    if (await btn.isVisible()) {
+                        const tag = await btn.evaluate(e => e.tagName.toLowerCase());
+                        
                         if (tag === 'form') {
-                            await this._editTelegramMessage(`📝 Submit Form: \`${selector}\``);
-                            await el.evaluate(f => f.submit());
-                            actionDone = true;
+                            await this._editTelegramMessage(`📝 Men-submit Form...`);
+                            await btn.evaluate(f => f.submit());
                         } else {
-                            const href = await el.getAttribute('href');
-                            if (href && href.startsWith('http') && !href.includes('javascript:')) {
-                                return await this._downloadWithAria2(href);
-                            }
-                            await this._editTelegramMessage(`🎯 Klik Tombol: \`${selector}\``);
-                            await el.click({ force: true });
-                            actionDone = true;
+                            const href = await btn.getAttribute('href');
+                            if (href && href.startsWith('http')) return await this._downloadWithAria2(href);
+                            await this._editTelegramMessage(`🎯 Mengeklik Tombol...`);
+                            await btn.click({ force: true });
                         }
-                        if (actionDone) break;
-                    } catch (e) { continue; }
+                        actionDone = true;
+                        break;
+                    }
                 }
 
                 if (actionDone) {
-                    const dlObj = await downloadPromise;
-                    if (dlObj) {
-                        const directUrl = dlObj.url();
-                        await dlObj.cancel();
+                    const dl = await downloadPromise;
+                    if (dl) {
+                        const directUrl = dl.url();
+                        await dl.cancel();
                         return await this._downloadWithAria2(directUrl);
                     }
-                    await currentPage.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => null);
+                    await page.waitForLoadState('networkidle').catch(() => null);
                 }
             } catch (e) { console.log(`Attempt ${attempt} gagal.`); }
         }
-        throw new Error("Gagal: Link download tidak ditemukan sampai akhir.");
+        
+        await this._sendScreenshot(`❌ Gagal Total. Cloudflare atau selector tidak tembus.`);
+        throw new Error("Gagal mendapatkan link download.");
     }
 
     async run() {
-        await this._sendTelegramMessage(`⏳ **Bot Start (Mobile Mode)...**`);
+        await this._sendTelegramMessage(`⏳ **Bot Engine Start (Headless: False)...**`);
         try {
-            this.browser = await chromium.launch({ headless: false, args: ['--no-sandbox'] });
-            this.context = await this.browser.newContext({ ...devices['iPhone 13'], acceptDownloads: true });
+            // BYPASS LOGIC: Headless False + Args Stealth
+            this.browser = await chromium.launch({ 
+                headless: false, 
+                args: [
+                    '--no-sandbox', 
+                    '--disable-blink-features=AutomationControlled'
+                ] 
+            });
+
+            // EMULASI MOBILE
+            const mobile = devices['iPhone 13'];
+            this.context = await this.browser.newContext({ ...mobile, acceptDownloads: true });
             
-            const finalFile = await this._processDefault();
-            
-            if (finalFile) {
-                const size = fs.statSync(finalFile).size;
-                fs.writeFileSync('downloaded_filename.txt', finalFile);
-                await this._editTelegramMessage(`✅ **Selesai!**\n📄 File: \`${finalFile}\`\n⚖️ Size: \`${this._humanSize(size)}\``);
+            const file = await this._processDefault();
+            if (file) {
+                const size = fs.statSync(file).size;
+                fs.writeFileSync('downloaded_filename.txt', file);
+                await this._editTelegramMessage(`✅ **Sukses!**\n📄 Nama: \`${file}\`\n⚖️ Size: \`${this._humanSize(size)}\``);
             }
         } catch (e) {
-            // KIRIM SCREENSHOT JIKA ERROR
             await this._editTelegramMessage(`❌ **Error:** ${e.message}`);
-            await this._sendScreenshot(`Debug Error: ${e.message}`);
             process.exit(1);
         } finally {
             if (this.browser) await this.browser.close();
