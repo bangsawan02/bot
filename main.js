@@ -4,7 +4,7 @@ chromium.use(StealthPlugin());
 
 const axios = require('axios');
 const fs = require('fs-extra');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const FormData = require('form-data');
 
 class DownloaderBot {
@@ -57,29 +57,24 @@ class DownloaderBot {
         } catch (e) {}
     }
 
-    async _sendScreenshot(caption) {
-        if (!this.context || !this.botToken) return;
-        try {
-            const pages = this.context.pages();
-            const page = pages[pages.length - 1];
-            if (!page) return;
-
-            const screenshotPath = 'error_debug.png';
-            await page.screenshot({ path: screenshotPath, fullPage: true });
-            
-            const form = new FormData();
-            form.append('chat_id', this.ownerId);
-            form.append('caption', caption);
-            form.append('photo', fs.createReadStream(screenshotPath));
-            
-            await axios.post(`https://api.telegram.org/bot${this.botToken}/sendPhoto`, form, { headers: form.getHeaders() });
-            fs.removeSync(screenshotPath);
-        } catch (e) { console.log("Gagal kirim screenshot:", e.message); }
+    // --- PYTHON HANDLER ---
+    async _installPythonRequirements() {
+        if (fs.existsSync('requirements.txt')) {
+            await this._editTelegramMessage("📦 **Python:** Menginstal `requirements.txt`...");
+            try {
+                execSync('pip install -r requirements.txt', { stdio: 'inherit' });
+                console.log("Requirements installed successfully.");
+            } catch (e) {
+                console.error("Gagal install requirements:", e.message);
+            }
+        }
     }
 
-    // --- PYTHON DELEGATION ENGINE ---
     async _runPythonSourceForge() {
-        await this._sendTelegramMessage(`🐍 **SourceForge Detected**\nMenjalankan \`main.py\` untuk bypass Cloudflare...`);
+        // 1. Install dulu jika ada requirements.txt
+        await this._installPythonRequirements();
+        
+        await this._editTelegramMessage(`🐍 **SourceForge Detected**\nMenjalankan \`main.py\` untuk bypass Cloudflare...`);
         
         return new Promise((resolve, reject) => {
             const py = spawn('python3', ['main.py', this.url], {
@@ -89,8 +84,9 @@ class DownloaderBot {
             py.stdout.on('data', (data) => {
                 const out = data.toString();
                 console.log(`[Python]: ${out}`);
-                if (out.includes('%')) { // Update progress jika ada persen
-                    this._editTelegramMessage(`🐍 **Python Progress:**\n\`${out.trim()}\``);
+                // Jika output mengandung informasi progress, edit pesan telegram
+                if (out.includes('%') || out.includes('Download')) {
+                    this._editTelegramMessage(`🐍 **Python Output:**\n\`${out.trim()}\``);
                 }
             });
 
@@ -136,7 +132,7 @@ class DownloaderBot {
             aria.on('close', (code) => {
                 if (code === 0) {
                     const files = fs.readdirSync('.').filter(f => 
-                        !['main.js', 'main.py', 'selectors.json', 'package.json'].includes(f) && 
+                        !['main.js', 'main.py', 'selectors.json', 'package.json', 'requirements.txt'].includes(f) && 
                         !f.endsWith('.png') && !f.endsWith('.aria2')
                     );
                     const sorted = files.map(f => ({ n: f, t: fs.statSync(f).mtime })).sort((a, b) => b.t - a.t);
@@ -146,7 +142,7 @@ class DownloaderBot {
         });
     }
 
-    // --- PLAYWRIGHT LOGIC (FOR NON-SF) ---
+    // --- PLAYWRIGHT ENGINE ---
     async _processDefault() {
         let currentPage = await this.context.newPage();
         
@@ -197,7 +193,6 @@ class DownloaderBot {
     }
 
     async run() {
-        // PERCABANGAN LOGIKA
         if (this.url.includes('sourceforge.net')) {
             try {
                 await this._runPythonSourceForge();
@@ -207,7 +202,6 @@ class DownloaderBot {
             }
         }
 
-        // DEFAULT ENGINE
         await this._sendTelegramMessage(`⏳ **Bot Start (Playwright Mode)...**`);
         try {
             this.browser = await chromium.launch({ headless: false, args: ['--no-sandbox'] });
@@ -222,7 +216,6 @@ class DownloaderBot {
             }
         } catch (e) {
             await this._editTelegramMessage(`❌ **Error:** ${e.message}`);
-            await this._sendScreenshot(`Debug Error`);
             process.exit(1);
         } finally {
             if (this.browser) await this.browser.close();
