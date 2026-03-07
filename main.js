@@ -55,65 +55,66 @@ class DownloaderBot {
         } catch (e) {}
     }
 
-    // --- ARIA2C WITH PROGRESS TRACKER ---
-    async _downloadWithAria2(url) {
-        await this._editTelegramMessage(`🚀 **Aria2c:** Memulai koneksi...`);
-        
-        return new Promise((resolve, reject) => {
-            // -x16: 16 koneksi, -s16: 16 split, --summary-interval=3: update tiap 3 detik
-            const aria = spawn('aria2c', [
-                '-x16', '-s16', 
-                '--summary-interval=3', 
-                '--console-log-level=notice',
-                '--file-allocation=none',
-                url
-            ]);
+// --- ARIA2C WITH PROGRESS TRACKER (FIXED) ---
+async _downloadWithAria2(url) {
+    await this._editTelegramMessage(`🚀 **Aria2c:** Memulai koneksi...`);
+    
+    return new Promise((resolve, reject) => {
+        const aria = spawn('aria2c', [
+            '-x16', '-s16', 
+            '--summary-interval=3', 
+            '--console-log-level=notice',
+            '--file-allocation=none',
+            '--auto-file-renaming=false',
+            url
+        ]);
 
-            let lastUpdate = 0;
-            let fileName = "Mengunduh...";
+        let lastUpdate = 0;
+        let fileName = "Mengunduh...";
 
-            aria.stdout.on('data', async (data) => {
-                const output = data.toString();
+        aria.stdout.on('data', async (data) => {
+            const output = data.toString();
 
-                // 1. Ekstrak Nama File (Biasanya muncul di awal log aria2)
-                const nameMatch = output.match(/|| (.+)/) || output.match(/Saving to: (.+)/);
-                if (nameMatch && fileName === "Mengunduh...") {
-                    fileName = path.basename(nameMatch[1]);
+            // Perbaikan Regex untuk menangkap nama file lebih akurat
+            const nameMatch = output.match(/Saving to: .*\/(.+)/) || output.match(/Saving to: (.+)/);
+            if (nameMatch && (fileName === "Mengunduh..." || fileName === undefined)) {
+                fileName = nameMatch[1].trim();
+            }
+
+            const progressMatch = output.match(/\((.*)%\).*DL:(.*)\]/);
+            if (progressMatch) {
+                const percent = progressMatch[1];
+                const speed = progressMatch[2];
+                
+                const now = Date.now();
+                if (now - lastUpdate > 4000) {
+                    lastUpdate = now;
+                    // Pastikan fileName bukan undefined sebelum diedit ke Telegram
+                    const safeFileName = fileName || "Unknown File";
+                    const status = `⬇️ **Aria2c Progress**\n\n📄 File: \`${safeFileName}\`\n📊 Progress: \`${percent}%\`\n⚡ Speed: \`${speed}\``;
+                    await this._editTelegramMessage(status);
                 }
-
-                // 2. Ekstrak Progress (Contoh output: [#123456 1.2MiB/10MiB(12%) CN:16 DL:2MiB])
-                const progressMatch = output.match(/\((.*)%\).*DL:(.*)\]/);
-                if (progressMatch) {
-                    const percent = progressMatch[1];
-                    const speed = progressMatch[2];
-                    
-                    // Throttling: Update Telegram tiap 4 detik saja biar gak kena limit
-                    const now = Date.now();
-                    if (now - lastUpdate > 4000) {
-                        lastUpdate = now;
-                        const status = `⬇️ **Downloading via Aria2c**\n\n📄 File: \`${fileName}\`\n📊 Progress: \`${percent}%\`\n⚡ Speed: \`${speed}\``;
-                        await this._editTelegramMessage(status);
-                    }
-                }
-            });
-
-            aria.on('close', (code) => {
-                if (code === 0) {
-                    // Cari file asli yang bukan .aria2
-                    const files = fs.readdirSync('.').filter(f => 
-                        !['main.js', 'selectors.json', 'package.json'].includes(f) && 
-                        !f.endsWith('.png') && !f.endsWith('.aria2')
-                    );
-                    const sorted = files.map(f => ({ n: f, t: fs.statSync(f).mtime })).sort((a, b) => b.t - a.t);
-                    resolve(sorted[0].n);
-                } else {
-                    reject(new Error(`Aria2 exit with code ${code}`));
-                }
-            });
-
-            aria.stderr.on('data', (data) => console.error(`[Aria2 Error] ${data}`));
+            }
         });
-    }
+
+        aria.on('close', (code) => {
+            if (code === 0) {
+                // Mencari file asli dengan filter yang lebih ketat
+                const files = fs.readdirSync('.').filter(f => 
+                    !['main.js', 'selectors.json', 'package.json', 'downloaded_filename.txt'].includes(f) && 
+                    !f.endsWith('.png') && !f.endsWith('.aria2')
+                );
+                
+                if (files.length === 0) return reject(new Error("File tidak ditemukan setelah download selesai."));
+                
+                const sorted = files.map(f => ({ n: f, t: fs.statSync(f).mtime })).sort((a, b) => b.t - a.t);
+                resolve(sorted[0].n);
+            } else {
+                reject(new Error(`Aria2 berhenti dengan kode ${code}`));
+            }
+        });
+    });
+}
 
     // --- MAIN PROCESS ---
     async _processDefault() {
