@@ -1,94 +1,96 @@
-const { chromium } = require('playwright-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const { spawn } = require('child_process');
+const { execSync, spawn } = require('child_process');
 const fs = require('fs');
+const cheerio = require('cheerio');
+const { URL } = require('url');
 
-chromium.use(StealthPlugin());
+// User-Agent konsisten
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
-async function getDirectLink(targetUrl) {
-    console.log(`🔎 Launching Stealth Browser for: ${targetUrl}`);
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-    });
-    const page = await context.newPage();
-
-    let finalDownloadUrl = null;
-
-    // Intersep request untuk menangkap URL yang mengandung mirror/download
-    page.on('download', download => {
-        finalDownloadUrl = download.url();
-        console.log(`✅ Intercepted Download URL: ${finalDownloadUrl}`);
-    });
-
+async function downloadSourceForge(targetUrl) {
     try {
-        await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 60000 });
-        
-        // Tunggu sebentar karena SF biasanya hitung mundur 5 detik
-        console.log("⏳ Waiting for SourceForge countdown and redirect...");
-        
-        // Kita paksa tunggu sampai ada navigasi atau download trigger
-        await page.waitForTimeout(10000); 
+        console.log(`🔎 Analyzing URL: ${targetUrl}`);
 
-        // Jika belum dapat, coba cari tombol "Problems Downloading?" lalu klik mirror pertama
-        if (!finalDownloadUrl) {
-            console.log("🤔 Auto-download didn't start. Trying to fetch from mirror list...");
-            const mirrorUrl = targetUrl.replace('/download', '') + '/settings/mirror_choices';
-            await page.goto(mirrorUrl, { waitUntil: 'networkidle' });
-            
-            // Klik mirror pertama yang tersedia
-            const firstMirror = await page.$('ul#mirrorList > li > a');
-            if (firstMirror) {
-                const href = await firstMirror.getAttribute('href');
-                finalDownloadUrl = href.startsWith('http') ? href : `https://sourceforge.net${href}`;
-            }
+        const cleanUrl = targetUrl.replace('/download', '');
+        const urlObj = new URL(cleanUrl);
+        const pathParts = urlObj.pathname.split('/').filter(p => p !== '');
+
+        const projectIndex = pathParts.indexOf('projects');
+        const filesIndex = pathParts.indexOf('files');
+        
+        if (projectIndex === -1 || filesIndex === -1) {
+            throw new Error("Bukan URL SourceForge yang valid.");
         }
 
-        await browser.close();
-        return finalDownloadUrl;
+        const projectName = pathParts[projectIndex + 1];
+        const filePath = pathParts.slice(filesIndex + 1).join('/');
+        const fileName = pathParts[pathParts.length - 1];
 
-    } catch (err) {
-        console.error("❌ Browser Error:", err.message);
-        await browser.close();
-        return null;
-    }
-}
+        const mirrorPageUrl = `https://sourceforge.net/settings/mirror_choices?projectname=${projectName}&filename=${filePath}`;
+        console.log(`🔗 Fetching Mirror Page: ${mirrorPageUrl}`);
 
-async function startAria(url) {
-    if (!url) {
-        console.error("❌ No valid download URL found.");
+        // 1. Ambil HTML Mirror List
+        const fetchHtmlCmd = `curl -L -s -A "${USER_AGENT}" \
+            -H "Referer: https://sourceforge.net/" \
+            "${mirrorPageUrl}"`;
+
+        const html = execSync(fetchHtmlCmd).toString();
+        const $ = cheerio.load(html);
+        const mirrorIds = [];
+        
+        $('ul#mirrorList > li').each((i, el) => {
+            const id = $(el).attr('id');
+            if (id) mirrorIds.push(id);
+        });
+
+        if (mirrorIds.length === 0) {
+            throw new Error("Gagal mengambil list mirror. Cek apakah IP diblokir.");
+        }
+
+        // 2. Pilih mirror pertama (paling stabil biasanya)
+        const selectedMirror = mirrorIds[0];
+        const finalDownloadUrl = `https://downloads.sourceforge.net/project/${projectName}/${filePath}?use_mirror=${selectedMirror}&viasf=1`;
+
+        console.log(`✅ Mirror selected: ${selectedMirror}`);
+        console.log(`🚀 Starting Download with CURL: ${fileName}`);
+
+        // 3. Jalankan CURL untuk mendownload file
+        // -L: follow redirect
+        // -#: progress bar simpel
+        // -C -: resume download jika terputus
+        const curlArgs = [
+            '-L', 
+            '-A', USER_AGENT,
+            '-H', `Referer: ${mirrorPageUrl}`,
+            '-o', fileName,
+            '--retry', '5',
+            '--retry-delay', '2',
+            finalDownloadUrl
+        ];
+
+        // Pakai spawn agar progress bar curl muncul di console GitHub Actions
+        const curlDownload = spawn('curl', curlArgs, { stdio: ['ignore', 'inherit', 'inherit'] });
+
+        curlDownload.on('close', (code) => {
+            if (code === 0) {
+                console.log(`\n✨ Download Success: ${fileName}`);
+                fs.writeFileSync('downloaded_filename.txt', fileName);
+                process.exit(0);
+            } else {
+                console.error(`\n❌ CURL Failed with exit code: ${code}`);
+                process.exit(1);
+            }
+        });
+
+    } catch (error) {
+        console.error(`❌ Script Error: ${error.message}`);
         process.exit(1);
     }
-
-    const fileName = url.split('/').pop().split('?')[0];
-    console.log(`🚀 Starting Aria2c for: ${fileName}`);
-
-    const aria2Args = [
-        '--console-log-level=warn',
-        '-x16', '-s16', '-k1M',
-        '--file-allocation=none',
-        '--check-certificate=false',
-        `--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36`,
-        '-o', fileName,
-        url
-    ];
-
-    const aria2 = spawn('aria2c', aria2Args, { stdio: 'inherit' });
-
-    aria2.on('close', (code) => {
-        if (code === 0) {
-            console.log(`✨ Success: ${fileName}`);
-            fs.writeFileSync('downloaded_filename.txt', fileName);
-            process.exit(0);
-        } else {
-            console.error(`❌ Aria2c error code: ${code}`);
-            process.exit(1);
-        }
-    });
 }
 
-(async () => {
-    const url = process.env.PAYLOAD_URL;
-    const directLink = await getDirectLink(url);
-    await startAria(directLink);
-})();
+const PAYLOAD_URL = process.env.PAYLOAD_URL;
+if (PAYLOAD_URL) {
+    downloadSourceForge(PAYLOAD_URL);
+} else {
+    console.error("Error: PAYLOAD_URL not set.");
+    process.exit(1);
+}
