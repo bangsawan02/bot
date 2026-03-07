@@ -39,7 +39,7 @@ async function downloadNinjaSF(targetUrl) {
         }
 
         // Pilih mirror pertama (Ninja style: manual selection)
-        const selectedMirror = mirrorIds[0];
+        const selectedMirror = mirrorIds[1];
         console.log(`✅ Selected Mirror: ${selectedMirror}`);
 
         // 3. Susun URL Final (Standard Ninja URL)
