@@ -1,37 +1,33 @@
-const axios = require('axios');
+const { execSync, spawn } = require('child_process');
 const fs = require('fs');
 const cheerio = require('cheerio');
-const { spawn } = require('child_process');
 
-// User-Agent browser asli
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
 async function downloadSourceForge(targetUrl) {
     try {
-        // 1. Ubah URL download biasa ke URL mirror_choices
-        // Contoh: .../iso/download -> .../settings/mirror_choices?projectname=...&filename=...
-        let mirrorPageUrl = targetUrl;
-        if (targetUrl.includes('/download')) {
-            const cleanUrl = targetUrl.replace('/download', '');
-            const parts = new URL(cleanUrl).pathname.split('/').filter(p => p !== '');
-            const projectName = parts[1];
-            const filePath = parts.slice(3).join('/');
-            mirrorPageUrl = `https://sourceforge.net/settings/mirror_choices?projectname=${projectName}&filename=${filePath}`;
-        }
+        // 1. Parsing URL untuk mendapatkan Mirror Page
+        const cleanUrl = targetUrl.replace('/download', '');
+        const urlObj = new URL(cleanUrl);
+        const parts = urlObj.pathname.split('/').filter(p => p !== '');
+        const projectName = parts[1];
+        const filePath = parts.slice(3).join('/');
+        const mirrorPageUrl = `https://sourceforge.net/settings/mirror_choices?projectname=${projectName}&filename=${filePath}`;
 
-        console.log(`🔎 Fetching Mirror Page: ${mirrorPageUrl}`);
+        console.log(`🔎 Fetching Mirror Page via CURL: ${mirrorPageUrl}`);
 
-        // 2. Ambil HTML-nya
-        const response = await axios.get(mirrorPageUrl, {
-            headers: { 
-                'User-Agent': USER_AGENT,
-                'Accept': 'text/html',
-                'Referer': 'https://sourceforge.net/'
-            }
-        });
+        // 2. Gunakan CURL sistem untuk bypass 403 (lebih sakti dari Axios)
+        // Kita tambahkan header LENGKAP agar dikira browser asli
+        const curlCmd = `curl -L -s -A "${USER_AGENT}" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8" \
+            -H "Accept-Language: en-US,en;q=0.5" \
+            -H "Referer: https://sourceforge.net/" \
+            "${mirrorPageUrl}"`;
 
-        // 3. Scraping elemen ul#mirrorList > li (Persis logika Python kamu)
-        const $ = cheerio.load(response.data);
+        const html = execSync(curlCmd).toString();
+
+        // 3. Scraping dengan Cheerio
+        const $ = cheerio.load(html);
         const mirrorIds = [];
         
         $('ul#mirrorList > li').each((i, el) => {
@@ -40,52 +36,50 @@ async function downloadSourceForge(targetUrl) {
         });
 
         if (mirrorIds.length === 0) {
-            console.log("HTML Response:", response.data.substring(0, 500)); // Debugging
-            throw new Error("Gagal menemukan list mirror (li#id). SourceForge mungkin mendeteksi bot.");
+            // Jika masih gagal, cek apakah kita kena captcha/challenge
+            if (html.includes("Challenge") || html.includes("Cloudflare")) {
+                throw new Error("Terdeteksi Cloudflare/Captcha. IP GitHub diblokir.");
+            }
+            throw new Error("Gagal menemukan list mirror. HTML tidak sesuai.");
         }
 
-        console.log(`✅ Ditemukan ${mirrorIds.length} mirror ID: ${mirrorIds.slice(0, 3).join(', ')}...`);
+        console.log(`✅ Ditemukan ${mirrorIds.length} mirror.`);
 
-        // 4. Susun link download menggunakan parameter ?use_mirror=ID
-        // Link format: [URL_ASLI_TANPA_DOWNLOAD]?use_mirror=[ID]
-        const baseDownloadUrl = targetUrl.endsWith('/download') ? targetUrl.replace('/download', '') : targetUrl;
-        const finalUrls = mirrorIds.map(id => `${baseDownloadUrl}?use_mirror=${id}`);
+        // 4. Susun Link
+        const fileName = filePath.split('/').pop();
+        const finalUrls = mirrorIds.slice(0, 10).map(id => `${cleanUrl}?use_mirror=${id}`);
 
-        // Ambil nama file dari URL
-        const fileName = baseDownloadUrl.split('/').pop();
-
-        console.log(`🚀 Memulai Aria2c untuk file: ${fileName}`);
-
-        // 5. Jalankan Aria2c dengan semua mirror
+        // 5. Jalankan Aria2c
+        console.log(`🚀 Downloading: ${fileName}`);
         const aria2Args = [
             '-x16', '-s16', '-j16', '-k1M',
             '--file-allocation=none',
-            '--check-certificate=false',
             `--user-agent=${USER_AGENT}`,
             `--header=Referer: ${mirrorPageUrl}`,
             '-o', fileName,
-            ...finalUrls // Masukkan semua URL mirror
+            ...finalUrls
         ];
 
         const aria2 = spawn('aria2c', aria2Args);
 
         aria2.stdout.on('data', (data) => {
-            const out = data.toString();
-            if (out.includes('%')) process.stdout.write(`\r${out.trim()}`);
+            if (data.toString().includes('%')) {
+                process.stdout.write(`\r${data.toString().trim()}`);
+            }
         });
 
         aria2.on('close', (code) => {
             if (code === 0) {
-                console.log(`\n✨ Download Berhasil: ${fileName}`);
+                console.log(`\n✨ Selesai: ${fileName}`);
                 fs.writeFileSync('downloaded_filename.txt', fileName);
             } else {
-                console.error("\n❌ Aria2c Gagal.");
+                console.error("\n❌ Aria2c gagal.");
                 process.exit(1);
             }
         });
 
     } catch (error) {
-        console.error("❌ Error:", error.message);
+        console.error(`❌ Error: ${error.message}`);
         process.exit(1);
     }
 }
