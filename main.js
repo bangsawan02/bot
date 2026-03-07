@@ -23,18 +23,12 @@ class DownloaderBot {
         try {
             const data = fs.readJsonSync('selectors.json');
             const domain = new URL(this.url).hostname.replace('www.', '');
-            
-            // Ambil selector berdasarkan domain, kalau gak ada pake default
-            const selected = data[domain] || data['default'];
-            console.log(`[Config] Menggunakan selector untuk: ${domain}`);
-            return selected;
+            return data[domain] || data['default'];
         } catch (e) {
-            console.log("[Error] Gagal baca selectors.json, pake fallback.");
-            return ["a:has-text('Download')", "#downloadButton", "#downloadbtn"];
+            return ["a[href^='http']", "a:has-text('Download')", "#downloadButton", "button:has-text('Download')"];
         }
     }
 
-    // --- TELEGRAM LOGIC ---
     async _sendTelegramMessage(text) {
         if (!this.botToken || !this.ownerId) return;
         try {
@@ -67,9 +61,9 @@ class DownloaderBot {
         } catch (e) {}
     }
 
-    // --- DOWNLOAD ENGINE ---
+    // --- ENGINE DOWNLOAD ARIA2C ---
     async _downloadWithAria2(url) {
-        await this._editTelegramMessage(`🚀 **Aria2c Engine:** Mendownload via Direct Link...`);
+        await this._editTelegramMessage(`🚀 **Aria2c Active:** Sikat via Direct Link...`);
         return new Promise((resolve, reject) => {
             const aria = spawn('aria2c', ['-x16', '-s16', '--summary-interval=0', url]);
             aria.on('close', (c) => {
@@ -77,63 +71,102 @@ class DownloaderBot {
                     const files = fs.readdirSync('.').filter(f => !['main.js', 'selectors.json', 'package.json'].includes(f) && !f.endsWith('.png'));
                     const sorted = files.map(f => ({ n: f, t: fs.statSync(f).mtime })).sort((a, b) => b.t - a.t);
                     resolve(sorted[0].n);
-                } else reject(new Error("Aria2 gagal"));
+                } else reject(new Error("Aria2 Error"));
             });
         });
     }
 
+    // --- ENGINE DOWNLOAD PLAYWRIGHT ---
+    async _handlePlaywrightDownload(download) {
+        const filename = download.suggestedFilename();
+        const savePath = path.join(process.cwd(), filename);
+        await this._editTelegramMessage(`⬇️ **Playwright Active:** Mengunduh \`${filename}\`...`);
+        await download.saveAs(savePath);
+        return filename;
+    }
+
+    // --- MAIN LOGIC (2X PERCOBAAN) ---
     async _processDefault() {
-        const page = await this.context.newPage();
+        let currentPage = await this.context.newPage();
         
-        // Block ads agar tidak timeout
-        await page.route('**/*', (route) => {
-            const url = route.request().url();
-            if (['google-analytics', 'doubleclick', 'adsystem', 'adskeeper', 'popads'].some(d => url.includes(d))) return route.abort();
+        // Block ads agar load cepat
+        await this.context.route('**/*', (route) => {
+            if (['google-analytics', 'popads', 'adskeeper', 'doubleclick'].some(d => route.request().url().includes(d))) return route.abort();
             route.continue();
         });
 
+        await currentPage.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
         for (let attempt = 1; attempt <= 2; attempt++) {
-            await this._editTelegramMessage(`🔎 Navigasi (Percobaan ${attempt}/2)...`);
-            try {
-                await page.goto(this.url, { waitUntil: 'load', timeout: 60000 });
-                await page.waitForTimeout(3000);
+            await this._editTelegramMessage(`🔎 Percobaan ${attempt}/2: Menganalisa halaman...`);
 
-                const downloadPromise = page.waitForEvent('download', { timeout: 60000 }).catch(() => null);
+            // 1. Ambil Tab Paling Baru (Ini handle otomatis kalo "pindah tab" atau "redirect")
+            const allPages = this.context.pages();
+            currentPage = allPages[allPages.length - 1]; 
+            
+            // Tunggu sebentar biar JS di halaman selesai render
+            await currentPage.waitForTimeout(3000); 
 
-                for (const selector of this.selectors) {
-                    try {
-                        const btn = page.locator(selector).first();
-                        await btn.waitFor({ state: 'attached', timeout: 7000 });
+            // Pasang kuping buat dengerin event download dari SEMUA tab
+            const downloadPromise = this.context.waitForEvent('download', { timeout: 15000 }).catch(() => null);
+            let selectorClicked = false;
 
-                        const href = await btn.getAttribute('href');
-                        if (href && href.startsWith('http') && !href.includes('javascript:')) {
-                            return await this._downloadWithAria2(href);
-                        }
+            // 2. Loop mencari selector
+            for (const selector of this.selectors) {
+                try {
+                    const btn = currentPage.locator(selector).first();
+                    await btn.waitFor({ state: 'attached', timeout: 5000 });
 
-                        await this._editTelegramMessage(`🎯 Klik Paksa: \`${selector}\``);
-                        await btn.scrollIntoViewIfNeeded().catch(() => null);
-                        await btn.click({ force: true });
-                        await page.waitForTimeout(5000);
-                    } catch (e) { console.log(`[Log] Skip ${selector}`); }
+                    // 3. Jika Ketemu, Cek Href
+                    const href = await btn.getAttribute('href');
+                    if (href && href.startsWith('http') && !href.includes('javascript:')) {
+                        await this._editTelegramMessage(`🔗 Href ditemukan pada \`${selector}\``);
+                        return await this._downloadWithAria2(href); // Langsung lempar ke Aria2c dan selesai
+                    }
+
+                    // 4. Jika tak ada href, Lanjut Klik
+                    await this._editTelegramMessage(`🎯 Force Click pada \`${selector}\``);
+                    await btn.scrollIntoViewIfNeeded().catch(() => null);
+                    await btn.click({ force: true });
+                    
+                    selectorClicked = true;
+                    break; // Berhenti mencari selector lain karena kita sudah ngeklik satu
+                } catch (e) {
+                    // Selector tidak ada, lanjut ke selector berikutnya di list
+                    continue; 
                 }
+            }
 
-                const download = await downloadPromise;
+            // 5. Cek apakah ada progress download setelah klik
+            if (selectorClicked) {
+                await this._editTelegramMessage(`⏳ Menunggu respon dari klik...`);
+                const download = await downloadPromise; // Nunggu maks 15 detik
+
                 if (download) {
-                    const filename = download.suggestedFilename();
-                    await download.saveAs(filename);
-                    return filename;
+                    return await this._handlePlaywrightDownload(download); // Download berjalann!
                 }
-            } catch (e) { if (attempt === 2) await this._sendScreenshot(page, "Timeout Navigasi"); }
+            } else {
+                await this._editTelegramMessage(`⚠️ Tidak ada selector yang cocok di percobaan ${attempt}.`);
+            }
+
+            // 6. Jika tidak ada download (redirect/refresh/pindah tab), loop berulang ke attempt 2.
+            // Di putaran kedua, dia akan mengambil `currentPage` yang paling baru lagi.
         }
-        throw new Error("Gagal mendapatkan download.");
+
+        // Jika sampai di sini, artinya 2x putaran sudah habis dan zonk.
+        const finalPage = this.context.pages().pop();
+        await this._sendScreenshot(finalPage, `❌ Gagal memicu download setelah 2x percobaan logika.`);
+        throw new Error("Gagal mendownload: Tidak ada respon valid dari web.");
     }
 
     async run() {
-        await this._sendTelegramMessage(`⏳ **Bot Working...**`);
+        await this._sendTelegramMessage(`⏳ **Memproses Target...**`);
         try {
-            this.browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+            this.browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
             this.context = await this.browser.newContext({ acceptDownloads: true });
+            
             const finalFile = await this._processDefault();
+            
             if (finalFile) {
                 fs.writeFileSync('downloaded_filename.txt', finalFile);
                 await this._editTelegramMessage(`✅ **Selesai:** \`${finalFile}\``);
