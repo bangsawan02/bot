@@ -3,7 +3,6 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const { URL } = require('url');
 
-// Identitas browser standar untuk menghindari 403
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 async function downloadSourceForge(targetUrl) {
@@ -14,13 +13,12 @@ async function downloadSourceForge(targetUrl) {
 
         const projectIndex = pathParts.indexOf('projects');
         const filesIndex = pathParts.indexOf('files');
-        const downloadIndex = pathParts.indexOf('download');
-
-        if (projectIndex === -1 || filesIndex === -1) {
-            throw new Error("Bukan URL SourceForge yang valid.");
-        }
-
+        
+        // Ambil project name
         const projectName = pathParts[projectIndex + 1];
+        
+        // Ambil path file: cari bagian setelah 'files' sampai sebelum 'download'
+        const downloadIndex = pathParts.indexOf('download');
         const endPathIndex = downloadIndex !== -1 ? downloadIndex : pathParts.length;
         const filePath = pathParts.slice(filesIndex + 1, endPathIndex).join('/');
         const fileName = pathParts[endPathIndex - 1];
@@ -28,80 +26,64 @@ async function downloadSourceForge(targetUrl) {
         console.log(`📦 Project: ${projectName}`);
         console.log(`📂 File Path: ${filePath}`);
 
-        // URL API Mirror
-        const mirrorChoicesUrl = `https://sourceforge.net/settings/mirror_choices?projectname=${projectName}&filename=${filePath}`;
-        console.log(mirrorChoicesUrl);
-        console.log(`🔗 Fetching mirrors from SourceForge API...`);
-        
-        // --- 1. BYPASS 403 DI AXIOS ---
-        // SourceForge butuh header AJAX yang lengkap agar tidak menolak request JSON
-        const response = await axios.get(mirrorChoicesUrl, {
-            headers: { 
-                'User-Agent': USER_AGENT,
-                'Accept': 'application/json, text/javascript, */*; q=0.01',
-                'Referer': targetUrl,
-                'X-Requested-With': 'XMLHttpRequest' 
-            }
-        });
-
-        const mirrors = response.data && response.data.mirrors ? response.data.mirrors : response.data;
-        if (!mirrors || !Array.isArray(mirrors) || mirrors.length === 0) {
-            throw new Error("Tidak ada mirror yang ditemukan atau format JSON berubah.");
-        }
-
-        // Ambil top 5 mirror
-        const directUrls = mirrors.slice(0, 5).map(m => 
-            `https://${m.shortname}.dl.sourceforge.net/project/${projectName}/${filePath}`
+        // --- STRATEGI BARU: AUTO-GENERATED DIRECT LINKS ---
+        // Karena API sering 403 atau return HTML, kita pakai mirror list yang paling stabil secara manual.
+        const knownMirrors = ['versaweb', 'managedway', 'altushost', 'constant', 'fastly'];
+        const directUrls = knownMirrors.map(m => 
+            `https://${m}.dl.sourceforge.net/project/${projectName}/${filePath}`
         );
 
-        console.log(`✅ Found ${directUrls.length} mirrors. Starting Aria2c...`);
+        // Tambahkan URL "master" sebagai cadangan terakhir
+        directUrls.push(`https://downloads.sourceforge.net/project/${projectName}/${filePath}`);
 
-        // --- 2. BYPASS 403 DI ARIA2C ---
-        // Jika Aria2c tidak diberi header ini, server mirror akan merespon 403
+        console.log(`🚀 Generated ${directUrls.length} potential direct links.`);
+        console.log(`📡 Testing first mirror: ${directUrls[0]}`);
+
+        // --- EKSEKUSI ARIA2C ---
         const aria2Args = [
-            '-x16', '-s16', '-j16', '-k1M',
+            '-x16', 
+            '-s16', 
+            '-j16', 
+            '-k1M',
             '--file-allocation=none',
             '--check-certificate=false',
-            `--user-agent=${USER_AGENT}`,            // PENTING!
-            `--header=Referer: ${targetUrl}`,        // PENTING!
+            '--retry-wait=5',
+            '--max-tries=10',
+            `--user-agent=${USER_AGENT}`,
+            `--header=Referer: https://sourceforge.net/projects/${projectName}/files/`,
             '-o', fileName,
-            ...directUrls
+            ...directUrls // Aria2c akan otomatis mencoba satu per satu kalau ada yang 403
         ];
 
         const aria2 = spawn('aria2c', aria2Args);
 
         aria2.stdout.on('data', (data) => {
             const output = data.toString();
-            if (output.includes('%')) console.log(output.trim());
+            // Tampilkan progres download agar GitHub Action tidak dianggap stuck
+            if (output.includes('%') || output.includes('CN:')) {
+                process.stdout.write(`\r${output.trim()}`);
+            }
         });
 
         aria2.stderr.on('data', (data) => {
-            console.error(`[Aria2c Error]: ${data}`);
+            console.error(`\n[Aria2c Alert]: ${data}`);
         });
 
         aria2.on('close', (code) => {
             if (code === 0) {
-                console.log(`✨ Download Success: ${fileName}`);
+                console.log(`\n\n✨ Download Success: ${fileName}`);
                 fs.writeFileSync('downloaded_filename.txt', fileName);
             } else {
-                console.error("❌ Aria2c exited with error code:", code);
+                console.error("\n❌ Aria2c failed. Code:", code);
                 process.exit(1);
             }
         });
 
     } catch (error) {
-        console.error("❌ Error:", error.message);
-        if (error.response) {
-            console.error(`Status: ${error.response.status} - Pastikan IP GitHub tidak diblokir total oleh CF.`);
-        }
+        console.error("\n❌ Error:", error.message);
         process.exit(1);
     }
 }
 
-// Eksekusi
-const url = process.env.PAYLOAD_URL || process.argv[2];
-if (url) {
-    downloadSourceForge(url);
-} else {
-    console.error("URL tidak ditemukan. Gunakan argumen atau set PAYLOAD_URL.");
-}
+const url = process.env.PAYLOAD_URL;
+downloadSourceForge(url);
