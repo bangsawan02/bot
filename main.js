@@ -3,35 +3,26 @@ const fs = require('fs');
 const cheerio = require('cheerio');
 const { URL } = require('url');
 
-// Identitas Browser Terpercaya
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
-async function downloadNinjaSF(targetUrl) {
+async function downloadWgetNinja(targetUrl) {
     try {
-        console.log(`🥷 Ninja Analysis: ${targetUrl}`);
+        console.log(`🥷 Wget Ninja Analysis: ${targetUrl}`);
 
-        // 1. Parsing URL untuk mendapatkan komponen path
+        // 1. Parsing URL
         const cleanUrl = targetUrl.split('?')[0].replace(/\/download$/, '');
         const urlObj = new URL(cleanUrl);
         const pathParts = urlObj.pathname.split('/').filter(p => p !== '');
         
-        // Struktur: /projects/[project]/files/[subfolders]/[file]
-        const projectIndex = pathParts.indexOf('projects');
-        const filesIndex = pathParts.indexOf('files');
-
-        if (projectIndex === -1 || filesIndex === -1) {
-            throw new Error("URL tidak valid (Missing projects/files path)");
-        }
-
-        const projectName = pathParts[projectIndex + 1];
-        const filePath = pathParts.slice(filesIndex + 1).join('/');
+        const projectName = pathParts[1];
+        const filePath = pathParts.slice(3).join('/');
         const fileName = pathParts[pathParts.length - 1];
 
-        // 2. Ambil List Mirror (Halaman Pilihan)
+        // 2. Ambil Mirror List (Sesuai dokumentasi "Specifying a mirror")
         const mirrorPageUrl = `https://sourceforge.net/settings/mirror_choices?projectname=${projectName}&filename=${filePath}`;
-        console.log(`🔎 Scraping Mirrors: ${mirrorPageUrl}`);
+        console.log(`🔎 Finding mirrors: ${mirrorPageUrl}`);
 
-        const fetchHtmlCmd = `curl -L -s -A "${USER_AGENT}" -H "Referer: https://sourceforge.net/" "${mirrorPageUrl}"`;
+        const fetchHtmlCmd = `curl -L -s -A "${USER_AGENT}" "${mirrorPageUrl}"`;
         const html = execSync(fetchHtmlCmd).toString();
         const $ = cheerio.load(html);
         
@@ -42,51 +33,54 @@ async function downloadNinjaSF(targetUrl) {
         });
 
         if (mirrorIds.length === 0) {
-            throw new Error("Gagal mendapatkan mirror. IP GitHub mungkin diblokir sementara.");
+            throw new Error("Mirror tidak ditemukan. Cek koneksi atau IP.");
         }
 
-        // Ambil mirror pertama
-        const selectedMirror = mirrorIds[1];
-        
-        // 3. Susun DIRECT URL (Melewati halaman 'Thank You' HTML)
-        // Format: https://[MIRROR].dl.sourceforge.net/project/[PROJECT]/[FILE_PATH]
-        const directMirrorUrl = `https://${selectedMirror}.dl.sourceforge.net/project/${projectName}/${filePath}`;
-
+        const selectedMirror = mirrorIds[0];
         console.log(`✅ Selected Mirror: ${selectedMirror}`);
-        console.log(`🚀 Ninja Attack (Direct)! Downloading: ${fileName}`);
 
-        // 4. Jalankan CURL dengan Header Anti-Bot
-        const curlArgs = [
-            '-L',                    // Follow redirect jika ada
-            '-A', USER_AGENT, 
-            '-H', `Referer: https://sourceforge.net/projects/${projectName}/files/`,
-            '--retry', '5',
-            '--connect-timeout', '30',
-            '-o', fileName,          // Simpan sebagai file ISO
-            directMirrorUrl          // Langsung tembak ke file server
+        // 3. Susun URL Download sesuai dokumentasi Ninja
+        // Format: [URL]/download?use_mirror=[ID]
+        const ninjaDownloadUrl = `${cleanUrl}/download?use_mirror=${selectedMirror}`;
+
+        console.log(`🚀 Wget Launching: ${fileName}`);
+
+        // 4. Jalankan Wget dengan parameter sakti:
+        // --user-agent: Menyamar jadi browser
+        // --content-disposition: Mengambil nama file asli dari header server
+        // --trust-server-names: Menghindari file tersimpan dengan nama 'download'
+        // -O: Nama output file
+        const wgetArgs = [
+            `--user-agent=${USER_AGENT}`,
+            '--header=Referer: https://sourceforge.net/',
+            '--content-disposition',
+            '--trust-server-names',
+            '--quiet',              // Agar log tidak terlalu penuh, tapi tetap ada progress
+            '--show-progress',      // Tampilkan progress bar
+            '--no-check-certificate',
+            '-O', fileName,         // Simpan dengan nama file yang sudah diparsing
+            ninjaDownloadUrl
         ];
 
-        // Pakai 'inherit' agar Progress Bar (Total Size) terlihat di GitHub Actions
-        const ninjaDownload = spawn('curl', curlArgs, { stdio: ['ignore', 'inherit', 'inherit'] });
+        const wgetProcess = spawn('wget', wgetArgs, { stdio: ['ignore', 'inherit', 'inherit'] });
 
-        ninjaDownload.on('close', (code) => {
+        wgetProcess.on('close', (code) => {
             if (code === 0) {
-                // Cek ukuran file setelah download selesai (Minimal harus > 10MB)
+                // Validasi ukuran (Ninja check)
                 const stats = fs.statSync(fileName);
-                const fileSizeInBytes = stats.size;
-                const fileSizeInMB = fileSizeInBytes / (1024 * 1024);
+                const sizeMB = stats.size / (1024 * 1024);
 
-                if (fileSizeInMB < 10) {
-                    console.error(`\n💀 ERROR: File terlalu kecil (${fileSizeInMB.toFixed(2)} MB). Sepertinya terdownload HTML, bukan ISO.`);
-                    fs.unlinkSync(fileName); // Hapus file sampah
+                if (sizeMB < 10) {
+                    console.error(`\n💀 Error: File cuma ${sizeMB.toFixed(2)}MB. Ini HTML, bukan ISO!`);
+                    fs.unlinkSync(fileName);
                     process.exit(1);
                 }
 
-                console.log(`\n✨ Mission Accomplished: ${fileName} (${fileSizeInMB.toFixed(2)} MB)`);
+                console.log(`\n✨ Mission Accomplished: ${fileName} (${sizeMB.toFixed(2)} MB)`);
                 fs.writeFileSync('downloaded_filename.txt', fileName);
                 process.exit(0);
             } else {
-                console.error(`\n❌ Ninja Failed. Exit Code: ${code}`);
+                console.error(`\n❌ Wget failed with exit code: ${code}`);
                 process.exit(1);
             }
         });
@@ -99,8 +93,8 @@ async function downloadNinjaSF(targetUrl) {
 
 const PAYLOAD_URL = process.env.PAYLOAD_URL;
 if (PAYLOAD_URL) {
-    downloadNinjaSF(PAYLOAD_URL);
+    downloadWgetNinja(PAYLOAD_URL);
 } else {
-    console.error("No PAYLOAD_URL provided.");
+    console.error("No URL provided.");
     process.exit(1);
 }
