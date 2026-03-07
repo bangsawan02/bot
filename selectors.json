@@ -13,8 +13,8 @@
     "form[name='F1']",
     "a[href^='https://udl']"
   ],
-  "pixeldrain": [
-    "#body > div > div.file_preview_row.svelte-jngqwx > div.file_preview.svelte-jngqwx.checkers > div.block.svelte-40do4p > div > button"
+  "sourceforge": [
+    "#remaining-buttons > div.large-12 > a.button.green"
   ],
   "default": [
     "a[href*='download']",
