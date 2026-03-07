@@ -5,7 +5,7 @@ import sys
 from utils import DownloaderBot
 
 # Dapatkan URL dari environment variable
-url_to_download = os.environ.get("MEDIAFIRE_PAGE_URL")
+url_to_download = sys.argv[1]
 
 if __name__ == "__main__":
     if url_to_download:
