@@ -185,7 +185,7 @@ class DownloaderBot {
     async run() {
         await this._sendTelegramMessage(`⏳ **Bot Start (Mobile Mode)...**`);
         try {
-            this.browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+            this.browser = await chromium.launch({ headless: false, args: ['--no-sandbox'] });
             this.context = await this.browser.newContext({ ...devices['iPhone 13'], acceptDownloads: true });
             
             const finalFile = await this._processDefault();
