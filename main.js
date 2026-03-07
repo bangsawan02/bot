@@ -30,7 +30,7 @@ async function downloadSourceForge(targetUrl) {
 
         // URL API Mirror
         const mirrorChoicesUrl = `https://sourceforge.net/settings/mirror_choices?projectname=${projectName}&filename=${filePath}`;
-        
+        console.log(mirrorChoicesUrl);
         console.log(`🔗 Fetching mirrors from SourceForge API...`);
         
         // --- 1. BYPASS 403 DI AXIOS ---
