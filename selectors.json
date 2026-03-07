@@ -13,6 +13,9 @@
     "form[name='F1']",
     "a[href^='https://udl']"
   ],
+  "pixeldrain": [
+    "#body > div > div.file_preview_row.svelte-jngqwx > div.file_preview.svelte-jngqwx.checkers > div.block.svelte-40do4p > div > button"
+  ],
   "default": [
     "a[href*='download']",
     "button:has-text('Download')",
