@@ -9,133 +9,221 @@ const { spawn } = require('child_process');
 
 class DownloaderBot {
 
-constructor(url) {
-    this.url = url;
-    this.botToken = process.env.BOT_TOKEN;
-    this.ownerId = process.env.OWNER_ID;
-    this.initialMessageId = null;
-    this.browser = null;
-    this.context = null;
-    this.downloadDir = path.resolve('./downloads');
+constructor(url){
 
-    fs.ensureDirSync(this.downloadDir);
+    this.url = url
+    this.botToken = process.env.BOT_TOKEN
+    this.ownerId = process.env.OWNER_ID
+    this.initialMessageId = null
 
-    this.selectors = this._loadSelectorsByDomain();
+    this.browser = null
+    this.context = null
+
+    this.downloadDir = path.resolve("./downloads")
+
+    fs.ensureDirSync(this.downloadDir)
 }
 
-_loadSelectorsByDomain() {
-    try {
-        if (fs.existsSync('selectors.json')) {
-            const data = fs.readJsonSync('selectors.json');
-            const domain = new URL(this.url).hostname.replace('www.', '');
-            return data[domain] || data['default'];
+_humanSize(bytes){
+
+    if(!bytes) return "0 B"
+
+    const i = Math.floor(Math.log(bytes)/Math.log(1024))
+
+    return (bytes/Math.pow(1024,i)).toFixed(2) + " " +
+    ["B","KB","MB","GB","TB"][i]
+}
+
+async _sendTelegramMessage(text){
+
+    if(!this.botToken || !this.ownerId) return
+
+    const res = await axios.post(
+        `https://api.telegram.org/bot${this.botToken}/sendMessage`,
+        {
+            chat_id:this.ownerId,
+            text,
+            parse_mode:"Markdown"
         }
-    } catch (e) {
-        console.log("selectors.json gagal dibaca, pakai default.");
-    }
+    )
 
-    return [
-        "a[href*='download']",
-        "a[download]",
-        "button:has-text('Download')",
-        "form"
-    ];
+    this.initialMessageId = res.data.result.message_id
 }
 
-_humanSize(bytes) {
-    if (!bytes || bytes === 0) return "0 B";
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    return (bytes / Math.pow(1024, i)).toFixed(2) + " " + ["B","KB","MB","GB","TB"][i];
-}
+async _editTelegramMessage(text){
 
-async _sendTelegramMessage(text) {
-    if (!this.botToken || !this.ownerId) return;
+    if(!this.initialMessageId)
+        return this._sendTelegramMessage(text)
 
-    try {
-        const res = await axios.post(`https://api.telegram.org/bot${this.botToken}/sendMessage`, {
-            chat_id: this.ownerId,
+    await axios.post(
+        `https://api.telegram.org/bot${this.botToken}/editMessageText`,
+        {
+            chat_id:this.ownerId,
+            message_id:this.initialMessageId,
             text,
-            parse_mode: "Markdown"
-        });
+            parse_mode:"Markdown"
+        }
+    ).catch(()=>{})
+}
 
-        this.initialMessageId = res.data.result.message_id;
-    } catch (e) {
-        console.error("Telegram error:", e.message);
+async _getDirectMirrorSF(url){
+
+    try{
+
+        const parts = url.split('/')
+
+        const project = parts[4]
+        const filename = parts[6]
+
+        const api =
+`https://sourceforge.net/settings/mirror_choices?projectname=${project}&filename=${filename}`
+
+        const res = await axios.get(api)
+
+        const mirrors = res.data.mirrors
+
+        if(!mirrors || mirrors.length === 0)
+            return url
+
+        const best = mirrors[0]
+
+        return `${best.url}/${project}/files/${filename}`
+
+    }catch(e){
+
+        console.log("mirror api gagal")
+
+        return url
     }
 }
 
-async _editTelegramMessage(text) {
+async _downloadWithAria2(url){
 
-    if (!this.initialMessageId)
-        return this._sendTelegramMessage(text);
+return new Promise((resolve,reject)=>{
 
-    try {
-        await axios.post(`https://api.telegram.org/bot${this.botToken}/editMessageText`, {
-            chat_id: this.ownerId,
-            message_id: this.initialMessageId,
-            text,
-            parse_mode: "Markdown"
-        }).catch(()=>{});
-    } catch {}
+    const aria = spawn("aria2c",[
+
+        "-x16",
+        "-s16",
+        "--min-split-size=1M",
+        "--file-allocation=none",
+        "--summary-interval=3",
+        "-d",this.downloadDir,
+        url
+
+    ])
+
+    aria.stdout.on("data",async data=>{
+
+        const text = data.toString()
+
+        const match = text.match(/\((.*)%\).*DL:(.*)\]/)
+
+        if(match){
+
+            await this._editTelegramMessage(
+`⬇️ **Aria2 Download**
+
+📊 Progress: \`${match[1]}%\`
+⚡ Speed: \`${match[2]}\``
+            )
+        }
+
+    })
+
+    aria.on("close",code=>{
+
+        if(code===0){
+
+            const files = fs.readdirSync(this.downloadDir)
+
+            const latest = files
+            .map(f=>({
+                name:f,
+                t:fs.statSync(path.join(this.downloadDir,f)).mtime
+            }))
+            .sort((a,b)=>b.t-a.t)[0]
+
+            resolve(path.join(this.downloadDir,latest.name))
+
+        }else{
+
+            reject(new Error("aria2 failed"))
+
+        }
+
+    })
+
+})
 }
 
+async _downloadWithCurl(targetUrl){
 
-async _downloadWithCurl(targetUrl) {
+return new Promise(async (resolve,reject)=>{
 
-return new Promise(async (resolve, reject) => {
+    const urlParts = targetUrl.split('/')
+    const fileName =
+    urlParts[urlParts.length-2] || "downloaded_file.iso"
 
-    const urlParts = targetUrl.split('/');
-    const fileName = urlParts[urlParts.length - 2] || 'downloaded_file.iso';
+    const filePath = path.join(this.downloadDir,fileName)
 
-    const filePath = path.join(this.downloadDir, fileName);
+    let totalSize = 0
 
-    // ambil ukuran file total
-    let totalSize = 0;
+    try{
 
-    try {
-        const head = await axios.head(targetUrl, { maxRedirects: 5 });
-        totalSize = parseInt(head.headers['content-length'] || "0");
-    } catch {}
+        const head = await axios.head(targetUrl,{maxRedirects:5})
 
-    const curlArgs = [
+        totalSize =
+        parseInt(head.headers["content-length"] || "0")
+
+    }catch{}
+
+    const curl = spawn("curl",[
         "-L",
-        "-o", filePath,
+        "-o",filePath,
         targetUrl
-    ];
+    ])
 
-    const curl = spawn("curl", curlArgs);
+    let lastSize = 0
+    let lastTime = Date.now()
 
-    let lastSize = 0;
-    let lastTime = Date.now();
+    const interval = setInterval(async ()=>{
 
-    const interval = setInterval(async () => {
+        if(!fs.existsSync(filePath)) return
 
-        if (!fs.existsSync(filePath)) return;
+        const stat = fs.statSync(filePath)
 
-        const stat = fs.statSync(filePath);
-        const downloaded = stat.size;
+        const downloaded = stat.size
 
-        const now = Date.now();
-        const timeDiff = (now - lastTime) / 1000;
+        const now = Date.now()
 
-        const speed = (downloaded - lastSize) / timeDiff;
+        const diff = (now-lastTime)/1000
 
-        lastSize = downloaded;
-        lastTime = now;
+        const speed = (downloaded-lastSize)/diff
 
-        let percent = totalSize ? (downloaded / totalSize * 100).toFixed(1) : "?";
+        lastSize = downloaded
+        lastTime = now
 
-        let eta = "?";
+        const percent =
+        totalSize ?
+        (downloaded/totalSize*100).toFixed(1) : "?"
 
-        if (totalSize && speed > 0) {
-            const remaining = totalSize - downloaded;
-            const sec = Math.floor(remaining / speed);
-            const m = Math.floor(sec / 60);
-            const s = sec % 60;
-            eta = `${m}m ${s}s`;
+        let eta="?"
+
+        if(totalSize && speed>0){
+
+            const remain = totalSize-downloaded
+
+            const sec = Math.floor(remain/speed)
+
+            const m = Math.floor(sec/60)
+
+            const s = sec%60
+
+            eta = `${m}m ${s}s`
         }
 
-        const speedMB = (speed / 1024 / 1024).toFixed(2);
+        const speedMB = (speed/1024/1024).toFixed(2)
 
         await this._editTelegramMessage(
 `⬇️ **Curl Download**
@@ -145,285 +233,83 @@ return new Promise(async (resolve, reject) => {
 ⚡ Speed: \`${speedMB} MB/s\`
 📦 Downloaded: \`${this._humanSize(downloaded)} / ${this._humanSize(totalSize)}\`
 ⏳ ETA: \`${eta}\``
-        );
+        )
 
-    }, 5000);
+    },5000)
 
-    curl.on("close", (code) => {
+    curl.on("close",code=>{
 
-        clearInterval(interval);
+        clearInterval(interval)
 
-        if (code === 0) {
+        if(code===0){
 
-            fs.writeFileSync("downloaded_filename.txt", fileName);
+            fs.writeFileSync(
+                "downloaded_filename.txt",
+                fileName
+            )
 
-            resolve(filePath);
+            resolve(filePath)
 
-        } else {
+        }else{
 
-            reject(new Error("Curl exit code " + code));
+            reject(new Error("curl failed"))
 
         }
 
-    });
+    })
 
-});
+})
 }
 
-async _downloadWithAria2(url) {
+async run(){
 
-    if (!url) return null;
+    if(this.url.includes("sourceforge.net")){
 
-    await this._editTelegramMessage(`🚀 **Aria2:** downloading...`);
+        await this._sendTelegramMessage(
+            "🔎 mencari mirror tercepat..."
+        )
 
-    return new Promise((resolve, reject) => {
+        const direct =
+        await this._getDirectMirrorSF(this.url)
 
-        const aria = spawn("aria2c", [
-            "-x16",
-            "-s16",
-            "--summary-interval=3",
-            "--file-allocation=none",
-            "--auto-file-renaming=false",
-            "-d", this.downloadDir,
-            url
-        ]);
+        const finalFile =
+        await this._downloadWithAria2(direct)
 
-        let lastUpdate = 0;
-        let fileName = "detecting...";
-
-        aria.stdout.on("data", async data => {
-
-            const output = data.toString();
-
-            const nameMatch = output.match(/Saving to: .*\/(.+)/) ||
-                              output.match(/Saving to: (.+)/);
-
-            if (nameMatch && fileName === "detecting...")
-                fileName = nameMatch[1].trim();
-
-            const progressMatch = output.match(/\((.*)%\).*DL:(.*)\]/);
-
-            if (progressMatch) {
-
-                const now = Date.now();
-
-                if (now - lastUpdate > 6000) {
-
-                    lastUpdate = now;
-
-                    await this._editTelegramMessage(
-`⬇️ **Aria2 Progress**
-
-📄 File: \`${fileName}\`
-📊 Progress: \`${progressMatch[1]}%\`
-⚡ Speed: \`${progressMatch[2]}\``
-                    );
-                }
-            }
-
-        });
-
-        aria.on("close", code => {
-
-            if (code === 0) {
-
-                const files = fs.readdirSync(this.downloadDir);
-
-                if (!files.length)
-                    return resolve(null);
-
-                const sorted = files
-                    .map(f => ({
-                        name: f,
-                        time: fs.statSync(path.join(this.downloadDir,f)).mtime
-                    }))
-                    .sort((a,b)=>b.time-a.time);
-
-                resolve(path.join(this.downloadDir, sorted[0].name));
-
-            } else {
-
-                reject(new Error("Aria2 exit code " + code));
-
-            }
-
-        });
-
-    });
-
-}
-
-
-async _processDefault() {
-
-    let page = await this.context.newPage();
-
-    await this.context.route("**/*", route => {
-
-        const url = route.request().url();
-
-        if ([
-            "analytics",
-            "adskeeper",
-            "doubleclick",
-            "googletagmanager",
-            "google-analytics",
-            "taboola",
-            "outbrain",
-            "popads"
-        ].some(d => url.includes(d)))
-            return route.abort();
-
-        route.continue();
-
-    });
-
-    for (let attempt = 1; attempt <= 2; attempt++) {
-
-        await this._editTelegramMessage(`🔎 scanning attempt ${attempt}/2`);
-
-        const downloadPromise =
-            this.context.waitForEvent("download",{timeout:45000}).catch(()=>null);
-
-        try {
-
-            await page.goto(this.url,{
-                waitUntil:"domcontentloaded",
-                timeout:60000
-            });
-
-            await page.waitForTimeout(3000);
-
-            for (const selector of this.selectors) {
-
-                try {
-
-                    const el = page.locator(selector).first();
-
-                    await el.waitFor({state:"attached",timeout:5000});
-
-                    const tag = await el.evaluate(e=>e.tagName.toLowerCase());
-
-                    if (tag==="form") {
-
-                        await el.evaluate(f=>f.submit());
-
-                    } else {
-
-                        const href = await el.getAttribute("href");
-
-                        if (href && href.startsWith("http") && !href.includes("javascript"))
-                            return await this._downloadWithAria2(href);
-
-                        await el.click({force:true});
-
-                    }
-
-                    break;
-
-                } catch {}
-
-            }
-
-            const dlObj = await downloadPromise;
-
-            if (dlObj) {
-
-                const directUrl = dlObj.url();
-
-                await dlObj.cancel();
-
-                return await this._downloadWithAria2(directUrl);
-
-            }
-
-        } catch {
-            console.log("attempt failed");
-        }
-
+        return this._finish(finalFile)
     }
 
-    throw new Error("Download link not found.");
+    await this._sendTelegramMessage(
+        "⬇️ memulai download..."
+    )
 
+    const finalFile =
+    await this._downloadWithCurl(this.url)
+
+    this._finish(finalFile)
 }
 
+_finish(file){
 
-async run() {
+    if(!file) return
 
-    if (this.url.includes("sourceforge.net")) {
+    const size = fs.statSync(file).size
 
-        try {
+    const name = path.basename(file)
 
-            const finalFile = await this._downloadWithCurl(this.url);
-
-            return this._finish(finalFile);
-
-        } catch (e) {
-
-            await this._editTelegramMessage(
-                `❌ Curl failed: ${e.message}, fallback Playwright`
-            );
-
-        }
-
-    }
-
-    await this._sendTelegramMessage("⏳ **Bot started (Playwright)**");
-
-    try {
-
-        this.browser = await chromium.launch({
-            headless:true,
-            args:["--no-sandbox"]
-        });
-
-        this.context = await this.browser.newContext({
-            ...devices["Desktop Chrome"],
-            acceptDownloads:true
-        });
-
-        const finalFile = await this._processDefault();
-
-        if (finalFile)
-            this._finish(finalFile);
-
-    } catch (e) {
-
-        await this._editTelegramMessage(`❌ **Error:** ${e.message}`);
-
-        process.exit(1);
-
-    } finally {
-
-        if (this.browser)
-            await this.browser.close();
-
-    }
-
-}
-
-_finish(filePath) {
-
-    if (!filePath) return;
-
-    const size = fs.statSync(filePath).size;
-    const name = path.basename(filePath);
-
-    fs.writeFileSync("downloaded_filename.txt", name);
+    fs.writeFileSync("downloaded_filename.txt",name)
 
     this._editTelegramMessage(
-`✅ **Download Finished**
+`✅ **Download Selesai**
 
 📄 File: \`${name}\`
 ⚖️ Size: \`${this._humanSize(size)}\``
-    );
-
+    )
 }
 
 }
 
+const target =
+process.env.PAYLOAD_URL || process.argv[2]
 
-const target = process.env.PAYLOAD_URL || process.argv[2];
-
-if (target)
-    new DownloaderBot(target).run();
+if(target)
+new DownloaderBot(target).run()
