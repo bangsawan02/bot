@@ -97,10 +97,6 @@ async _downloadWithCurl(targetUrl) {
     });
 }
 
-// Ambil URL dari Environment Variable PAYLOAD_URL (standar GitHub Actions)
-const PAYLOAD_URL = process.env.PAYLOAD_URL || "https://sourceforge.net/projects/blissos-x86/files/Official/BlissOS14/OpenGApps/Generic/Bliss-v14.10.3-x86_64-OFFICIAL-opengapps-20241012.iso/download";
-
-runCurlNinja(PAYLOAD_URL);
 
     // --- ARIA2C ENGINE ---
     async _downloadWithAria2(url) {
