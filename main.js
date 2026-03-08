@@ -1,80 +1,88 @@
-const { execSync, spawn } = require('child_process');
+const { chromium } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const { spawn } = require('child_process');
 const fs = require('fs');
-const { URL } = require('url');
+const path = require('path');
 
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+// Gunakan Stealth Plugin agar tidak terdeteksi sebagai bot Playwright
+chromium.use(StealthPlugin());
 
-async function downloadBypassNinja(targetUrl) {
+async function downloadWithPlaywright(targetUrl) {
+    console.log(`🔎 Launching Stealth Browser: ${targetUrl}`);
+    
+    const browser = await chromium.launch({ 
+        headless: true, // Wajib true di GitHub Actions
+        args: ['--no-sandbox', '--disable-setuid-sandbox'] 
+    });
+
+    const context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        viewport: { width: 1280, height: 720 }
+    });
+
+    const page = await context.newPage();
+
     try {
-        console.log(`🥷 Anti-403 Ninja Mission: ${targetUrl}`);
-
-        let ninjaUrl = targetUrl.split('?')[0];
-        if (!ninjaUrl.endsWith('/download')) {
-            ninjaUrl = ninjaUrl.replace(/\/$/, '') + '/download';
+        // Pastikan URL mengarah ke /download
+        let downloadPageUrl = targetUrl.split('?')[0];
+        if (!downloadPageUrl.endsWith('/download')) {
+            downloadPageUrl = downloadPageUrl.replace(/\/$/, '') + '/download';
         }
 
-        // 1. Ambil Cookie dan URL Redirect Final menggunakan CURL (Silent)
-        // Kita butuh ini agar SourceForge mengira kita sudah melewati halaman "Waiting..."
-        console.log("🍪 Harvesting cookies and resolving redirect...");
-        const cookieFile = 'sf-cookies.txt';
+        console.log(`🌐 Navigating to: ${downloadPageUrl}`);
+
+        // Buat promise untuk menangkap event download
+        const downloadPromise = page.waitForEvent('download', { timeout: 60000 });
+
+        // Pergi ke halaman download
+        await page.goto(downloadPageUrl, { waitUntil: 'networkidle' });
+
+        console.log("⏳ Waiting for SourceForge countdown (5-10s)...");
         
-        // Perintah ini akan menyimpan cookie ke file
-        execSync(`curl -L -c ${cookieFile} -A "${USER_AGENT}" -s -o /dev/null "${ninjaUrl}"`);
+        // Terkadang harus klik manual jika auto-download tidak jalan
+        const manualLink = page.locator('a.direct-download, a.button.green');
+        if (await manualLink.isVisible()) {
+            console.log("clicking manual download button...");
+            await manualLink.click();
+        }
 
-        // 2. Tentukan nama file dari URL
-        const urlObj = new URL(ninjaUrl);
-        const pathParts = urlObj.pathname.split('/').filter(p => p !== '');
-        const fileName = pathParts[pathParts.length - 2] || 'file.iso';
+        // Tunggu sampai SourceForge melempar file aslinya
+        const download = await downloadPromise;
+        const fileName = download.suggestedFilename();
+        const downloadPath = path.join(process.cwd(), fileName);
 
-        console.log(`🚀 Wget Launching with Cookies: ${fileName}`);
+        console.log(`🚀 Download Started: ${fileName}`);
 
-        // 3. Jalankan Wget dengan Cookie yang sudah dipanen
-        const wgetArgs = [
-            `--user-agent=${USER_AGENT}`,
-            `--load-cookies=${cookieFile}`,  // PENTING: Gunakan cookie hasil pancingan
-            '--header=Referer: https://sourceforge.net/',
-            '--content-disposition',
-            '--trust-server-names',
-            '--no-check-certificate',
-            '--continue',
-            '--show-progress',
-            '-O', fileName,
-            ninjaUrl
-        ];
+        // Simpan file ke disk
+        await download.saveAs(downloadPath);
+        
+        // Verifikasi ukuran file
+        const stats = fs.statSync(downloadPath);
+        const sizeMB = stats.size / (1024 * 1024);
 
-        const wgetProcess = spawn('wget', wgetArgs, { stdio: ['ignore', 'inherit', 'inherit'] });
+        if (sizeMB < 10) {
+            throw new Error(`File terlalu kecil (${sizeMB.toFixed(2)}MB). Kemungkinan hanya HTML.`);
+        }
 
-        wgetProcess.on('close', (code) => {
-            // Hapus file cookie setelah selesai
-            if (fs.existsSync(cookieFile)) fs.unlinkSync(cookieFile);
+        console.log(`\n✨ Mission Accomplished: ${fileName} (${sizeMB.toFixed(2)} MB)`);
+        
+        // Simpan nama file untuk digunakan di workflow selanjutnya
+        fs.writeFileSync('downloaded_filename.txt', fileName);
 
-            if (code === 0) {
-                const stats = fs.statSync(fileName);
-                const sizeMB = stats.size / (1024 * 1024);
-
-                if (sizeMB < 10) {
-                    console.error(`\n💀 Error: File cuma ${sizeMB.toFixed(2)}MB. Masih kena 403 atau HTML.`);
-                    process.exit(1);
-                }
-
-                console.log(`\n✨ Mission Accomplished: ${fileName} (${sizeMB.toFixed(2)} MB)`);
-                fs.writeFileSync('downloaded_filename.txt', fileName);
-                process.exit(0);
-            } else {
-                console.error(`\n❌ Wget failed code: ${code}`);
-                process.exit(1);
-            }
-        });
+        await browser.close();
+        process.exit(0);
 
     } catch (error) {
-        console.error(`\n💀 Error: ${error.message}`);
+        console.error(`\n💀 Playwright Error: ${error.message}`);
+        await browser.close();
         process.exit(1);
     }
 }
 
 const PAYLOAD_URL = process.env.PAYLOAD_URL;
 if (PAYLOAD_URL) {
-    downloadBypassNinja(PAYLOAD_URL);
+    downloadWithPlaywright(PAYLOAD_URL);
 } else {
+    console.error("No PAYLOAD_URL provided.");
     process.exit(1);
 }
