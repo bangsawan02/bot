@@ -1,88 +1,96 @@
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const { spawn } = require('child_process');
+const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-// Gunakan Stealth Plugin agar tidak terdeteksi sebagai bot Playwright
 chromium.use(StealthPlugin());
 
-async function downloadWithPlaywright(targetUrl) {
-    console.log(`🔎 Launching Stealth Browser: ${targetUrl}`);
-    
-    const browser = await chromium.launch({ 
-        headless: true, // Wajib true di GitHub Actions
-        args: ['--no-sandbox', '--disable-setuid-sandbox'] 
-    });
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-    const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        viewport: { width: 1280, height: 720 }
-    });
+// Fungsi untuk mengubah cookie format Netscape (curl) ke JSON (Playwright)
+function parseNetscapeCookies(filePath) {
+    const cookies = [];
+    const content = fs.readFileSync(filePath, 'utf8');
+    content.split('\n').forEach(line => {
+        if (!line.trim() || line.startsWith('#')) return;
+        const parts = line.split('\t');
+        if (parts.length < 7) return;
 
-    const page = await context.newPage();
+        cookies.push({
+            name: parts[5],
+            value: parts[6].trim(),
+            domain: parts[0].startsWith('.') ? parts[0] : parts[0],
+            path: parts[2],
+            expires: parseInt(parts[4]),
+            httpOnly: false,
+            secure: parts[3] === 'TRUE'
+        });
+    });
+    return cookies;
+}
+
+async function hybridNinjaDownload(targetUrl) {
+    const cookieFile = 'cookies.txt';
+    const downloadPage = targetUrl.split('?')[0].endsWith('/download') ? targetUrl : `${targetUrl.replace(/\/$/, '')}/download`;
 
     try {
-        // Pastikan URL mengarah ke /download
-        let downloadPageUrl = targetUrl.split('?')[0];
-        if (!downloadPageUrl.endsWith('/download')) {
-            downloadPageUrl = downloadPageUrl.replace(/\/$/, '') + '/download';
-        }
+        console.log(`🍪 Step 1: Harvesting cookies with CURL...`);
+        // Kita pancing SourceForge agar memberikan cookie session awal
+        execSync(`curl -s -L -c ${cookieFile} -A "${USER_AGENT}" -o /dev/null "https://sourceforge.net/"`);
+        
+        const cookies = parseNetscapeCookies(cookieFile);
+        console.log(`✅ ${cookies.length} cookies harvested.`);
 
-        console.log(`🌐 Navigating to: ${downloadPageUrl}`);
+        console.log(`🎭 Step 2: Injecting cookies into Playwright...`);
+        const browser = await chromium.launch({ headless: true });
+        const context = await browser.newContext({ userAgent: USER_AGENT });
+        
+        // Suntikkan cookie hasil curl tadi
+        await context.addCookies(cookies);
 
-        // Buat promise untuk menangkap event download
-        const downloadPromise = page.waitForEvent('download', { timeout: 60000 });
+        const page = await context.newPage();
+        
+        console.log(`🌐 Step 3: Navigating to download page: ${downloadPage}`);
+        
+        // Siapkan listener untuk download
+        const downloadPromise = page.waitForEvent('download', { timeout: 90000 });
 
         // Pergi ke halaman download
-        await page.goto(downloadPageUrl, { waitUntil: 'networkidle' });
+        await page.goto(downloadPage, { waitUntil: 'networkidle' });
 
-        console.log("⏳ Waiting for SourceForge countdown (5-10s)...");
-        
-        // Terkadang harus klik manual jika auto-download tidak jalan
-        const manualLink = page.locator('a.direct-download, a.button.green');
-        if (await manualLink.isVisible()) {
-            console.log("clicking manual download button...");
-            await manualLink.click();
+        console.log("⏳ Waiting for SourceForge to process (Countdown)...");
+
+        // Jika ada tombol manual, klik saja untuk mempercepat
+        const manualBtn = page.locator('a.direct-download');
+        if (await manualBtn.isVisible()) {
+            await manualBtn.click();
         }
 
-        // Tunggu sampai SourceForge melempar file aslinya
         const download = await downloadPromise;
         const fileName = download.suggestedFilename();
-        const downloadPath = path.join(process.cwd(), fileName);
+        const savePath = path.join(process.cwd(), fileName);
 
-        console.log(`🚀 Download Started: ${fileName}`);
+        console.log(`🚀 Final Attack! Downloading: ${fileName}`);
+        await download.saveAs(savePath);
 
-        // Simpan file ke disk
-        await download.saveAs(downloadPath);
-        
-        // Verifikasi ukuran file
-        const stats = fs.statSync(downloadPath);
-        const sizeMB = stats.size / (1024 * 1024);
+        // Validasi
+        const stats = fs.statSync(savePath);
+        if (stats.size / (1024 * 1024) < 10) throw new Error("File too small. Still hit by HTML gate.");
 
-        if (sizeMB < 10) {
-            throw new Error(`File terlalu kecil (${sizeMB.toFixed(2)}MB). Kemungkinan hanya HTML.`);
-        }
-
-        console.log(`\n✨ Mission Accomplished: ${fileName} (${sizeMB.toFixed(2)} MB)`);
-        
-        // Simpan nama file untuk digunakan di workflow selanjutnya
+        console.log(`\n✨ Mission Accomplished: ${fileName} (${(stats.size / (1024 * 1024)).toFixed(2)} MB)`);
         fs.writeFileSync('downloaded_filename.txt', fileName);
 
         await browser.close();
+        if (fs.existsSync(cookieFile)) fs.unlinkSync(cookieFile);
         process.exit(0);
 
     } catch (error) {
-        console.error(`\n💀 Playwright Error: ${error.message}`);
-        await browser.close();
+        console.error(`\n💀 Hybrid Ninja Failed: ${error.message}`);
+        if (fs.existsSync(cookieFile)) fs.unlinkSync(cookieFile);
         process.exit(1);
     }
 }
 
-const PAYLOAD_URL = process.env.PAYLOAD_URL;
-if (PAYLOAD_URL) {
-    downloadWithPlaywright(PAYLOAD_URL);
-} else {
-    console.error("No PAYLOAD_URL provided.");
-    process.exit(1);
-}
+const url = process.env.PAYLOAD_URL;
+if (url) hybridNinjaDownload(url);
