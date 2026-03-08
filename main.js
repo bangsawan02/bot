@@ -1,23 +1,22 @@
-const { chromium, devices } = require('playwright-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-chromium.use(StealthPlugin());
+const { chromium } = require("playwright-extra")
+const StealthPlugin = require("puppeteer-extra-plugin-stealth")
+chromium.use(StealthPlugin())
 
-const axios = require('axios');
-const fs = require('fs-extra');
-const path = require('path');
-const { spawn } = require('child_process');
+const axios = require("axios")
+const fs = require("fs-extra")
+const path = require("path")
+const { spawn } = require("child_process")
 
 class DownloaderBot {
 
 constructor(url){
 
     this.url = url
+
     this.botToken = process.env.BOT_TOKEN
     this.ownerId = process.env.OWNER_ID
-    this.initialMessageId = null
 
-    this.browser = null
-    this.context = null
+    this.initialMessageId = null
 
     this.downloadDir = path.resolve("./downloads")
 
@@ -30,8 +29,8 @@ _humanSize(bytes){
 
     const i = Math.floor(Math.log(bytes)/Math.log(1024))
 
-    return (bytes/Math.pow(1024,i)).toFixed(2) + " " +
-    ["B","KB","MB","GB","TB"][i]
+    return (bytes/Math.pow(1024,i)).toFixed(2) +
+    " " + ["B","KB","MB","GB","TB"][i]
 }
 
 async _sendTelegramMessage(text){
@@ -66,32 +65,21 @@ async _editTelegramMessage(text){
     ).catch(()=>{})
 }
 
-async _getDirectMirrorSF(url){
+async _resolveRedirect(url){
 
     try{
 
-        const parts = url.split('/')
+        const res = await axios.head(url,{
+            maxRedirects:10,
+            validateStatus:null
+        })
 
-        const project = parts[4]
-        const filename = parts[6]
+        if(res.request?.res?.responseUrl)
+            return res.request.res.responseUrl
 
-        const api =
-`https://sourceforge.net/settings/mirror_choices?projectname=${project}&filename=${filename}`
+        return url
 
-        const res = await axios.get(api)
-
-        const mirrors = res.data.mirrors
-
-        if(!mirrors || mirrors.length === 0)
-            return url
-
-        const best = mirrors[0]
-
-        return `${best.url}/${project}/files/${filename}`
-
-    }catch(e){
-
-        console.log("mirror api gagal")
+    }catch{
 
         return url
     }
@@ -108,6 +96,7 @@ return new Promise((resolve,reject)=>{
         "--min-split-size=1M",
         "--file-allocation=none",
         "--summary-interval=3",
+        "--max-connection-per-server=16",
         "-d",this.downloadDir,
         url
 
@@ -116,6 +105,8 @@ return new Promise((resolve,reject)=>{
     aria.stdout.on("data",async data=>{
 
         const text = data.toString()
+
+        console.log(text)
 
         const match = text.match(/\((.*)%\).*DL:(.*)\]/)
 
@@ -129,6 +120,10 @@ return new Promise((resolve,reject)=>{
             )
         }
 
+    })
+
+    aria.stderr.on("data",data=>{
+        console.log(data.toString())
     })
 
     aria.on("close",code=>{
@@ -148,7 +143,7 @@ return new Promise((resolve,reject)=>{
 
         }else{
 
-            reject(new Error("aria2 failed"))
+            reject(new Error("aria2 exit code "+code))
 
         }
 
@@ -162,16 +157,22 @@ async _downloadWithCurl(targetUrl){
 return new Promise(async (resolve,reject)=>{
 
     const urlParts = targetUrl.split('/')
-    const fileName =
-    urlParts[urlParts.length-2] || "downloaded_file.iso"
 
-    const filePath = path.join(this.downloadDir,fileName)
+    const fileName =
+    urlParts[urlParts.length-2] ||
+    "downloaded_file.iso"
+
+    const filePath =
+    path.join(this.downloadDir,fileName)
 
     let totalSize = 0
 
     try{
 
-        const head = await axios.head(targetUrl,{maxRedirects:5})
+        const head = await axios.head(
+            targetUrl,
+            {maxRedirects:5}
+        )
 
         totalSize =
         parseInt(head.headers["content-length"] || "0")
@@ -187,7 +188,7 @@ return new Promise(async (resolve,reject)=>{
     let lastSize = 0
     let lastTime = Date.now()
 
-    const interval = setInterval(async ()=>{
+    const interval = setInterval(async()=>{
 
         if(!fs.existsSync(filePath)) return
 
@@ -206,9 +207,10 @@ return new Promise(async (resolve,reject)=>{
 
         const percent =
         totalSize ?
-        (downloaded/totalSize*100).toFixed(1) : "?"
+        (downloaded/totalSize*100).toFixed(1)
+        : "?"
 
-        let eta="?"
+        let eta = "?"
 
         if(totalSize && speed>0){
 
@@ -223,7 +225,8 @@ return new Promise(async (resolve,reject)=>{
             eta = `${m}m ${s}s`
         }
 
-        const speedMB = (speed/1024/1024).toFixed(2)
+        const speedMB =
+        (speed/1024/1024).toFixed(2)
 
         await this._editTelegramMessage(
 `⬇️ **Curl Download**
@@ -266,11 +269,13 @@ async run(){
     if(this.url.includes("sourceforge.net")){
 
         await this._sendTelegramMessage(
-            "🔎 mencari mirror tercepat..."
+            "🔎 resolving mirror..."
         )
 
         const direct =
-        await this._getDirectMirrorSF(this.url)
+        await this._resolveRedirect(this.url)
+
+        console.log("Direct mirror:",direct)
 
         const finalFile =
         await this._downloadWithAria2(direct)
@@ -279,7 +284,7 @@ async run(){
     }
 
     await this._sendTelegramMessage(
-        "⬇️ memulai download..."
+        "⬇️ starting download..."
     )
 
     const finalFile =
@@ -296,10 +301,13 @@ _finish(file){
 
     const name = path.basename(file)
 
-    fs.writeFileSync("downloaded_filename.txt",name)
+    fs.writeFileSync(
+        "downloaded_filename.txt",
+        name
+    )
 
     this._editTelegramMessage(
-`✅ **Download Selesai**
+`✅ **Download Finished**
 
 📄 File: \`${name}\`
 ⚖️ Size: \`${this._humanSize(size)}\``
