@@ -84,7 +84,9 @@ async _downloadWithCurl(targetUrl) {
 
 return new Promise((resolve, reject) => {
 
-    const fileName = path.basename(new URL(targetUrl).pathname) || "downloaded_file";
+    const urlParts = targetUrl.split('/');
+    const fileName = urlParts[urlParts.length - 2] || 'downloaded_file.iso';
+
     const filePath = path.join(this.downloadDir, fileName);
 
     const curlArgs = [
