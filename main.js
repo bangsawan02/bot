@@ -103,20 +103,11 @@ return new Promise((resolve, reject) => {
 
         buffer += data.toString();
 
-        /*
-        curl progress format kira-kira:
-        54  1234k  12.4M  1m33s
-        */
+        const match = buffer.match(/(\d{1,3})%/);
 
-        const progressMatch = buffer.match(/(\d{1,3})%\s+([\d\.]+\w?)\s+([\d\.]+\w?)\s+([\w:]+)/);
+        if (match) {
 
-        if (progressMatch) {
-
-            const percent = progressMatch[1];
-            const downloaded = progressMatch[2];
-            const speed = progressMatch[3];
-            const eta = progressMatch[4];
-
+            const percent = match[1];
             const now = Date.now();
 
             if (now - lastUpdate > 6000) {
@@ -127,10 +118,7 @@ return new Promise((resolve, reject) => {
 `⬇️ **Curl Download**
 
 📄 File: \`${fileName}\`
-📊 Progress: \`${percent}%\`
-⚡ Speed: \`${speed}/s\`
-📦 Downloaded: \`${downloaded}\`
-⏳ ETA: \`${eta}\``
+📊 Progress: \`${percent}%\``
                 );
 
             }
@@ -158,7 +146,6 @@ return new Promise((resolve, reject) => {
 
 });
 }
-
 
 async _downloadWithAria2(url) {
 
