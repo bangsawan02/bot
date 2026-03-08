@@ -82,55 +82,76 @@ async _editTelegramMessage(text) {
 
 async _downloadWithCurl(targetUrl) {
 
-return new Promise((resolve, reject) => {
+return new Promise(async (resolve, reject) => {
 
     const urlParts = targetUrl.split('/');
     const fileName = urlParts[urlParts.length - 2] || 'downloaded_file.iso';
 
     const filePath = path.join(this.downloadDir, fileName);
 
+    // ambil ukuran file total
+    let totalSize = 0;
+
+    try {
+        const head = await axios.head(targetUrl, { maxRedirects: 5 });
+        totalSize = parseInt(head.headers['content-length'] || "0");
+    } catch {}
+
     const curlArgs = [
         "-L",
-        "--progress-bar",
         "-o", filePath,
         targetUrl
     ];
 
     const curl = spawn("curl", curlArgs);
 
-    let buffer = "";
-    let lastUpdate = 0;
+    let lastSize = 0;
+    let lastTime = Date.now();
 
-    curl.stderr.on("data", async (data) => {
+    const interval = setInterval(async () => {
 
-        buffer += data.toString();
+        if (!fs.existsSync(filePath)) return;
 
-        const match = buffer.match(/(\d{1,3})%/);
+        const stat = fs.statSync(filePath);
+        const downloaded = stat.size;
 
-        if (match) {
+        const now = Date.now();
+        const timeDiff = (now - lastTime) / 1000;
 
-            const percent = match[1];
-            const now = Date.now();
+        const speed = (downloaded - lastSize) / timeDiff;
 
-            if (now - lastUpdate > 6000) {
+        lastSize = downloaded;
+        lastTime = now;
 
-                lastUpdate = now;
+        let percent = totalSize ? (downloaded / totalSize * 100).toFixed(1) : "?";
 
-                await this._editTelegramMessage(
+        let eta = "?";
+
+        if (totalSize && speed > 0) {
+            const remaining = totalSize - downloaded;
+            const sec = Math.floor(remaining / speed);
+            const m = Math.floor(sec / 60);
+            const s = sec % 60;
+            eta = `${m}m ${s}s`;
+        }
+
+        const speedMB = (speed / 1024 / 1024).toFixed(2);
+
+        await this._editTelegramMessage(
 `⬇️ **Curl Download**
 
 📄 File: \`${fileName}\`
-📊 Progress: \`${percent}%\``
-                );
+📊 Progress: \`${percent}%\`
+⚡ Speed: \`${speedMB} MB/s\`
+📦 Downloaded: \`${this._humanSize(downloaded)} / ${this._humanSize(totalSize)}\`
+⏳ ETA: \`${eta}\``
+        );
 
-            }
-
-            buffer = "";
-        }
-
-    });
+    }, 5000);
 
     curl.on("close", (code) => {
+
+        clearInterval(interval);
 
         if (code === 0) {
 
