@@ -1,323 +1,378 @@
-const { chromium } = require("playwright-extra")
-const StealthPlugin = require("puppeteer-extra-plugin-stealth")
-chromium.use(StealthPlugin())
+const { chromium, devices } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+chromium.use(StealthPlugin());
 
-const axios = require("axios")
-const fs = require("fs-extra")
-const path = require("path")
-const { spawn } = require("child_process")
+const axios = require('axios');
+const fs = require('fs-extra');
+const { spawn } = require('child_process');
 
 class DownloaderBot {
 
-constructor(url){
-
-    this.url = url
-
-    this.botToken = process.env.BOT_TOKEN
-    this.ownerId = process.env.OWNER_ID
-
-    this.initialMessageId = null
-
-    this.downloadDir = path.resolve("./downloads")
-
-    fs.ensureDirSync(this.downloadDir)
-}
-
-_humanSize(bytes){
-
-    if(!bytes) return "0 B"
-
-    const i = Math.floor(Math.log(bytes)/Math.log(1024))
-
-    return (bytes/Math.pow(1024,i)).toFixed(2) +
-    " " + ["B","KB","MB","GB","TB"][i]
-}
-
-async _sendTelegramMessage(text){
-
-    if(!this.botToken || !this.ownerId) return
-
-    const res = await axios.post(
-        `https://api.telegram.org/bot${this.botToken}/sendMessage`,
-        {
-            chat_id:this.ownerId,
-            text,
-            parse_mode:"Markdown"
-        }
-    )
-
-    this.initialMessageId = res.data.result.message_id
-}
-
-async _editTelegramMessage(text){
-
-    if(!this.initialMessageId)
-        return this._sendTelegramMessage(text)
-
-    await axios.post(
-        `https://api.telegram.org/bot${this.botToken}/editMessageText`,
-        {
-            chat_id:this.ownerId,
-            message_id:this.initialMessageId,
-            text,
-            parse_mode:"Markdown"
-        }
-    ).catch(()=>{})
-}
-
-async _resolveRedirect(url){
-
-    try{
-
-        const res = await axios.head(url,{
-            maxRedirects:10,
-            validateStatus:null
-        })
-
-        if(res.request?.res?.responseUrl)
-            return res.request.res.responseUrl
-
-        return url
-
-    }catch{
-
-        return url
+    constructor(url) {
+        this.url = url;
+        this.botToken = process.env.BOT_TOKEN;
+        this.ownerId = process.env.OWNER_ID;
+        this.initialMessageId = null;
+        this.browser = null;
+        this.context = null;
+        this.selectors = this._loadSelectorsByDomain();
     }
-}
 
-async _downloadWithAria2(url){
+    _loadSelectorsByDomain() {
 
-return new Promise((resolve,reject)=>{
+        try {
 
-    const aria = spawn("aria2c",[
+            if (fs.existsSync('selectors.json')) {
 
-        "-x16",
-        "-s16",
-        "--min-split-size=1M",
-        "--file-allocation=none",
-        "--summary-interval=3",
-        "--max-connection-per-server=16",
-        "-d",this.downloadDir,
-        url
+                const data = fs.readJsonSync('selectors.json');
+                const domain = new URL(this.url).hostname.replace('www.', '');
 
-    ])
+                return data[domain] || data['default'];
 
-    aria.stdout.on("data",async data=>{
+            }
 
-        const text = data.toString()
+        } catch (e) {}
 
-        console.log(text)
+        return [
+            "a[href^='http']",
+            "form",
+            "button:has-text('Download')"
+        ];
+    }
 
-        const match = text.match(/\((.*)%\).*DL:(.*)\]/)
+    _humanSize(bytes) {
 
-        if(match){
+        if (!bytes || bytes === 0) return "0 B";
 
-            await this._editTelegramMessage(
-`⬇️ **Aria2 Download**
+        const i = Math.floor(Math.log(bytes) / Math.log(1024));
 
-📊 Progress: \`${match[1]}%\`
-⚡ Speed: \`${match[2]}\``
-            )
+        return (
+            (bytes / Math.pow(1024, i)).toFixed(2)
+            + " "
+            + ["B", "KB", "MB", "GB"][i]
+        );
+    }
+
+    async _sendTelegramMessage(text) {
+
+        if (!this.botToken || !this.ownerId) return;
+
+        try {
+
+            const res = await axios.post(
+                `https://api.telegram.org/bot${this.botToken}/sendMessage`,
+                {
+                    chat_id: this.ownerId,
+                    text,
+                    parse_mode: "Markdown"
+                }
+            );
+
+            this.initialMessageId = res.data.result.message_id;
+
+        } catch (e) {}
+    }
+
+    async _editTelegramMessage(text) {
+
+        if (!this.initialMessageId) {
+            return this._sendTelegramMessage(text);
         }
 
-    })
+        try {
 
-    aria.stderr.on("data",data=>{
-        console.log(data.toString())
-    })
+            await axios.post(
+                `https://api.telegram.org/bot${this.botToken}/editMessageText`,
+                {
+                    chat_id: this.ownerId,
+                    message_id: this.initialMessageId,
+                    text,
+                    parse_mode: "Markdown"
+                }
+            );
 
-    aria.on("close",code=>{
+        } catch (e) {}
 
-        if(code===0){
+    }
 
-            const files = fs.readdirSync(this.downloadDir)
+    async _resolveSourceForge(url) {
 
-            const latest = files
-            .map(f=>({
-                name:f,
-                t:fs.statSync(path.join(this.downloadDir,f)).mtime
-            }))
-            .sort((a,b)=>b.t-a.t)[0]
+        try {
 
-            resolve(path.join(this.downloadDir,latest.name))
+            const res = await axios({
+                url: url,
+                method: "GET",
+                maxRedirects: 0,
+                validateStatus: null
+            });
 
-        }else{
+            if (
+                res.status >= 300 &&
+                res.status < 400 &&
+                res.headers.location
+            ) {
 
-            reject(new Error("aria2 exit code "+code))
+                let redirect = res.headers.location;
+
+                if (redirect.startsWith("//")) {
+                    redirect = "https:" + redirect;
+                }
+
+                return redirect;
+
+            }
+
+            const res2 = await axios.get(url, { maxRedirects: 10 });
+
+            return res2.request.res.responseUrl;
+
+        } catch (e) {
+
+            throw new Error(
+                "Resolve SourceForge gagal: " + e.message
+            );
 
         }
+    }
 
-    })
+    async _downloadWithAria2(url) {
 
-})
-}
-
-async _downloadWithCurl(targetUrl){
-
-return new Promise(async (resolve,reject)=>{
-
-    const urlParts = targetUrl.split('/')
-
-    const fileName =
-    urlParts[urlParts.length-2] ||
-    "downloaded_file.iso"
-
-    const filePath =
-    path.join(this.downloadDir,fileName)
-
-    let totalSize = 0
-
-    try{
-
-        const head = await axios.head(
-            targetUrl,
-            {maxRedirects:5}
-        )
-
-        totalSize =
-        parseInt(head.headers["content-length"] || "0")
-
-    }catch{}
-
-    const curl = spawn("curl",[
-        "-L",
-        "-o",filePath,
-        targetUrl
-    ])
-
-    let lastSize = 0
-    let lastTime = Date.now()
-
-    const interval = setInterval(async()=>{
-
-        if(!fs.existsSync(filePath)) return
-
-        const stat = fs.statSync(filePath)
-
-        const downloaded = stat.size
-
-        const now = Date.now()
-
-        const diff = (now-lastTime)/1000
-
-        const speed = (downloaded-lastSize)/diff
-
-        lastSize = downloaded
-        lastTime = now
-
-        const percent =
-        totalSize ?
-        (downloaded/totalSize*100).toFixed(1)
-        : "?"
-
-        let eta = "?"
-
-        if(totalSize && speed>0){
-
-            const remain = totalSize-downloaded
-
-            const sec = Math.floor(remain/speed)
-
-            const m = Math.floor(sec/60)
-
-            const s = sec%60
-
-            eta = `${m}m ${s}s`
-        }
-
-        const speedMB =
-        (speed/1024/1024).toFixed(2)
+        if (!url) return null;
 
         await this._editTelegramMessage(
-`⬇️ **Curl Download**
+            "🚀 Aria2 mulai download..."
+        );
 
-📄 File: \`${fileName}\`
-📊 Progress: \`${percent}%\`
-⚡ Speed: \`${speedMB} MB/s\`
-📦 Downloaded: \`${this._humanSize(downloaded)} / ${this._humanSize(totalSize)}\`
-⏳ ETA: \`${eta}\``
-        )
+        return new Promise((resolve, reject) => {
 
-    },5000)
+            const aria = spawn(
+                'aria2c',
+                [
+                    '-x16',
+                    '-s16',
+                    '--summary-interval=3',
+                    '--file-allocation=none',
+                    '--auto-file-renaming=false',
+                    url
+                ]
+            );
 
-    curl.on("close",code=>{
+            let fileName = "Detecting...";
+            let lastUpdate = 0;
 
-        clearInterval(interval)
+            aria.stdout.on(
+                'data',
+                async (data) => {
 
-        if(code===0){
+                    const output = data.toString();
 
-            fs.writeFileSync(
-                "downloaded_filename.txt",
-                fileName
-            )
+                    const nameMatch =
+                        output.match(/Saving to: .*\/(.+)/);
 
-            resolve(filePath)
+                    if (nameMatch) {
+                        fileName = nameMatch[1];
+                    }
 
-        }else{
+                    const progressMatch =
+                        output.match(/\((.*)%\).*DL:(.*)\]/);
 
-            reject(new Error("curl failed"))
+                    if (progressMatch) {
+
+                        const now = Date.now();
+
+                        if (now - lastUpdate > 4000) {
+
+                            lastUpdate = now;
+
+                            await this._editTelegramMessage(
+`⬇️ Download
+
+📄 ${fileName}
+📊 ${progressMatch[1]}%
+⚡ ${progressMatch[2]}`
+                            );
+
+                        }
+
+                    }
+
+                }
+            );
+
+            aria.on(
+                'close',
+                (code) => {
+
+                    if (code !== 0) {
+                        reject(new Error("aria2 gagal"));
+                        return;
+                    }
+
+                    const files = fs.readdirSync('.')
+                        .filter(f => !f.endsWith('.aria2'))
+                        .map(f => ({
+                            name: f,
+                            time: fs.statSync(f).mtime
+                        }))
+                        .sort((a,b)=>b.time-a.time);
+
+                    resolve(
+                        files.length
+                        ? files[0].name
+                        : null
+                    );
+
+                }
+            );
+
+        });
+
+    }
+
+    async _handleSourceForge() {
+
+        await this._editTelegramMessage(
+            "🔎 Detect SourceForge mirror..."
+        );
+
+        const resolved =
+            await this._resolveSourceForge(this.url);
+
+        await this._editTelegramMessage(
+            `✅ Mirror ditemukan\n\n${resolved}`
+        );
+
+        return this._downloadWithAria2(resolved);
+
+    }
+
+    async _processDefault() {
+
+        const page = await this.context.newPage();
+
+        await page.goto(
+            this.url,
+            {
+                waitUntil: 'domcontentloaded',
+                timeout: 60000
+            }
+        );
+
+        await page.waitForTimeout(3000);
+
+        for (const selector of this.selectors) {
+
+            try {
+
+                const el =
+                    page.locator(selector).first();
+
+                await el.waitFor({
+                    state: 'attached',
+                    timeout: 5000
+                });
+
+                const href =
+                    await el.getAttribute('href');
+
+                if (
+                    href &&
+                    href.startsWith("http")
+                ) {
+
+                    return this._downloadWithAria2(href);
+
+                }
+
+                await el.click({ force: true });
+
+            } catch (e) {}
 
         }
 
-    })
+        throw new Error(
+            "Link download tidak ditemukan"
+        );
 
-})
-}
-
-async run(){
-
-    if(this.url.includes("sourceforge.net")){
-
-        await this._sendTelegramMessage(
-            "🔎 resolving mirror..."
-        )
-
-        const direct =
-        await this._resolveRedirect(this.url)
-
-        console.log("Direct mirror:",direct)
-
-        const finalFile =
-        await this._downloadWithAria2(direct)
-
-        return this._finish(finalFile)
     }
 
-    await this._sendTelegramMessage(
-        "⬇️ starting download..."
-    )
+    async run() {
 
-    const finalFile =
-    await this._downloadWithCurl(this.url)
+        await this._sendTelegramMessage(
+            "⏳ Bot start"
+        );
 
-    this._finish(finalFile)
-}
+        try {
 
-_finish(file){
+            if (
+                this.url.includes(
+                    "sourceforge.net"
+                )
+            ) {
 
-    if(!file) return
+                const file =
+                    await this._handleSourceForge();
 
-    const size = fs.statSync(file).size
+                const size =
+                    fs.statSync(file).size;
 
-    const name = path.basename(file)
+                await this._editTelegramMessage(
+`✅ Selesai
 
-    fs.writeFileSync(
-        "downloaded_filename.txt",
-        name
-    )
+📄 ${file}
+⚖️ ${this._humanSize(size)}`
+                );
 
-    this._editTelegramMessage(
-`✅ **Download Finished**
+                return;
+            }
 
-📄 File: \`${name}\`
-⚖️ Size: \`${this._humanSize(size)}\``
-    )
-}
+            this.browser =
+                await chromium.launch({
+                    headless: false,
+                    args: ['--no-sandbox']
+                });
+
+            this.context =
+                await this.browser.newContext({
+                    ...devices['iPhone 13'],
+                    acceptDownloads: true
+                });
+
+            const file =
+                await this._processDefault();
+
+            const size =
+                fs.statSync(file).size;
+
+            await this._editTelegramMessage(
+`✅ Selesai
+
+📄 ${file}
+⚖️ ${this._humanSize(size)}`
+            );
+
+        } catch (e) {
+
+            await this._editTelegramMessage(
+                `❌ Error\n${e.message}`
+            );
+
+        } finally {
+
+            if (this.browser) {
+                await this.browser.close();
+            }
+
+        }
+
+    }
 
 }
 
 const target =
-process.env.PAYLOAD_URL || process.argv[2]
+    process.env.PAYLOAD_URL
+    || process.argv[2];
 
-if(target)
-new DownloaderBot(target).run()
+if (target) {
+    new DownloaderBot(target).run();
+}
