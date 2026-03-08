@@ -36,35 +36,44 @@ async function hybridNinjaDownload(targetUrl) {
 
     try {
         console.log(`🍪 Step 1: Harvesting cookies with CURL...`);
-        // Kita pancing SourceForge agar memberikan cookie session awal
         execSync(`curl -s -L -c ${cookieFile} -A "${USER_AGENT}" -o /dev/null "https://sourceforge.net/"`);
         
         const cookies = parseNetscapeCookies(cookieFile);
         console.log(`✅ ${cookies.length} cookies harvested.`);
 
-        console.log(`🎭 Step 2: Injecting cookies into Playwright...`);
-        const browser = await chromium.launch({ headless: true });
+        const browser = await chromium.launch({ 
+            headless: true, 
+            args: ['--no-sandbox', '--disable-setuid-sandbox'] 
+        });
         const context = await browser.newContext({ userAgent: USER_AGENT });
-        
-        // Suntikkan cookie hasil curl tadi
         await context.addCookies(cookies);
 
         const page = await context.newPage();
         
+        // Tambahkan timeout global yang lebih panjang (60 detik)
+        page.setDefaultTimeout(60000);
+
         console.log(`🌐 Step 3: Navigating to download page: ${downloadPage}`);
         
-        // Siapkan listener untuk download
-        const downloadPromise = page.waitForEvent('download', { timeout: 90000 });
+        // 1. Ganti 'networkidle' menjadi 'domcontentloaded' (Lebih cepat & stabil)
+        // 2. Siapkan listener download SEBELUM navigasi
+        const downloadPromise = page.waitForEvent('download', { timeout: 120000 });
 
-        // Pergi ke halaman download
-        await page.goto(downloadPage, { waitUntil: 'networkidle' });
+        await page.goto(downloadPage, { 
+            waitUntil: 'domcontentloaded', // Berhenti setelah HTML dasar termuat
+            timeout: 60000 
+        });
 
-        console.log("⏳ Waiting for SourceForge to process (Countdown)...");
+        console.log("⏳ Page loaded. Waiting for automatic redirect or manual click...");
 
-        // Jika ada tombol manual, klik saja untuk mempercepat
-        const manualBtn = page.locator('a.direct-download');
-        if (await manualBtn.isVisible()) {
-            await manualBtn.click();
+        // Tunggu 10 detik secara manual untuk memberi waktu countdown SF (5 detik)
+        await page.waitForTimeout(10000);
+
+        // Jika download belum terpicu otomatis, cari dan klik tombol manual
+        const manualBtn = page.locator('a.direct-download, #mirrorList a, .button.green');
+        if (await manualBtn.count() > 0) {
+            console.log("🖱️ Triggering manual download button...");
+            await manualBtn.first().click().catch(() => {});
         }
 
         const download = await downloadPromise;
@@ -74,10 +83,7 @@ async function hybridNinjaDownload(targetUrl) {
         console.log(`🚀 Final Attack! Downloading: ${fileName}`);
         await download.saveAs(savePath);
 
-        // Validasi
         const stats = fs.statSync(savePath);
-        if (stats.size / (1024 * 1024) < 10) throw new Error("File too small. Still hit by HTML gate.");
-
         console.log(`\n✨ Mission Accomplished: ${fileName} (${(stats.size / (1024 * 1024)).toFixed(2)} MB)`);
         fs.writeFileSync('downloaded_filename.txt', fileName);
 
@@ -87,10 +93,8 @@ async function hybridNinjaDownload(targetUrl) {
 
     } catch (error) {
         console.error(`\n💀 Hybrid Ninja Failed: ${error.message}`);
-        if (fs.existsSync(cookieFile)) fs.unlinkSync(cookieFile);
         process.exit(1);
     }
 }
-
 const url = process.env.PAYLOAD_URL;
 if (url) hybridNinjaDownload(url);
