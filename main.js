@@ -82,40 +82,81 @@ async _editTelegramMessage(text) {
 
 async _downloadWithCurl(targetUrl) {
 
-    return new Promise((resolve, reject) => {
+return new Promise((resolve, reject) => {
 
-        const fileName = path.basename(new URL(targetUrl).pathname) || "downloaded_file";
+    const fileName = path.basename(new URL(targetUrl).pathname) || "downloaded_file";
+    const filePath = path.join(this.downloadDir, fileName);
 
-        console.log("Starting curl download:", fileName);
+    const curlArgs = [
+        "-L",
+        "--progress-bar",
+        "-o", filePath,
+        targetUrl
+    ];
 
-        const filePath = path.join(this.downloadDir, fileName);
+    const curl = spawn("curl", curlArgs);
 
-        const curlArgs = [
-            "-L",
-            "-o", filePath,
-            targetUrl
-        ];
+    let buffer = "";
+    let lastUpdate = 0;
 
-        const curlProcess = spawn("curl", curlArgs, { stdio: "inherit" });
+    curl.stderr.on("data", async (data) => {
 
-        curlProcess.on("close", code => {
+        buffer += data.toString();
 
-            if (code === 0) {
+        /*
+        curl progress format kira-kira:
+        54  1234k  12.4M  1m33s
+        */
 
-                fs.writeFileSync("downloaded_filename.txt", fileName);
+        const progressMatch = buffer.match(/(\d{1,3})%\s+([\d\.]+\w?)\s+([\d\.]+\w?)\s+([\w:]+)/);
 
-                resolve(filePath);
+        if (progressMatch) {
 
-            } else {
+            const percent = progressMatch[1];
+            const downloaded = progressMatch[2];
+            const speed = progressMatch[3];
+            const eta = progressMatch[4];
 
-                reject(new Error("Curl exited with code " + code));
+            const now = Date.now();
+
+            if (now - lastUpdate > 6000) {
+
+                lastUpdate = now;
+
+                await this._editTelegramMessage(
+`⬇️ **Curl Download**
+
+📄 File: \`${fileName}\`
+📊 Progress: \`${percent}%\`
+⚡ Speed: \`${speed}/s\`
+📦 Downloaded: \`${downloaded}\`
+⏳ ETA: \`${eta}\``
+                );
 
             }
 
-        });
+            buffer = "";
+        }
 
     });
 
+    curl.on("close", (code) => {
+
+        if (code === 0) {
+
+            fs.writeFileSync("downloaded_filename.txt", fileName);
+
+            resolve(filePath);
+
+        } else {
+
+            reject(new Error("Curl exit code " + code));
+
+        }
+
+    });
+
+});
 }
 
 
