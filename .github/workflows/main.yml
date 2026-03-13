@@ -7,54 +7,106 @@ on:
 jobs:
   download-and-release:
     runs-on: ubuntu-latest
-    
     permissions:
       contents: write
 
     env:
       PAYLOAD_URL: ${{ github.event.client_payload.url }}
+      PAYLOAD_SENDER: ${{ github.event.client_payload.sender }}
+      PAYLOAD_MODE: ${{ github.event.client_payload.mode }}
       BOT_TOKEN: ${{ github.event.client_payload.bot_token }}
+      GOOGLE_CLIENT_ID: ${{ github.event.client_payload.client_id }}
+      GOOGLE_CLIENT_SECRET: ${{ github.event.client_payload.client_secret }}
+      DRIVE_REFRESH_TOKEN: ${{ github.event.client_payload.refresh_token }}
       OWNER_ID: ${{ github.event.client_payload.sender }}
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 1. RESTORE CACHE (Ambil folder modules & browser)
+      # =========================================================
+      # 1. RESTORE CACHE SECTION (Hanya Mengambil)
+      # =========================================================
       - name: Restore Node & Playwright Cache
         uses: actions/cache/restore@v4
         with:
           path: |
             node_modules
             ~/.cache/ms-playwright
-          key: ${{ runner.os }}-node-v5-${{ hashFiles('package.json') }}
+          key: ${{ runner.os }}-node-v1-${{ hashFiles('package.json') }}
           restore-keys: |
-            ${{ runner.os }}-node-v5-
+            ${{ runner.os }}-node-v1-
 
-      # 2. INSTALLATION (Akan sangat cepat jika cache hit)
-      - name: Install Dependencies
+      - name: Restore Pip Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-v1-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-v1-
+
+      # =========================================================
+      # 2. INSTALLATION
+      # =========================================================
+      - name: Install Node Dependencies
         run: |
           npm install
-          # Install browser tanpa --with-deps (biasanya lib dasar sudah ada di ubuntu-latest)
-          npx playwright install chromium
-          
-          # Install megatools & aria2 hanya jika dibutuhkan (kondisional)
-          if [[ "${{ env.PAYLOAD_URL }}" == *"mega.nz"* || "${{ env.PAYLOAD_URL }}" == *"pixeldrain"* ]]; then
-            sudo apt-get update && sudo apt-get install -y megatools aria2
+          npx playwright install chromium 
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            ls 
           fi
 
-      # 3. EXECUTION
-      - name: Run Downloader
+      - name: Install System Tools
         run: |
-          # Install xvfb secara instan untuk headles mode browser
-          sudo apt-get install -y xvfb
-          xvfb-run --auto-servernum node main.js
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb
+          if [[ "${{ env.PAYLOAD_URL }}" == *"mega.nz"* ]]; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends megatools
+          fi
+
+      # =========================================================
+      # 3. EXECUTION
+      # =========================================================
+      - name: Run Node.js Downloader
+        run: |
+          sudo rm -f /tmp/.X99-lock
+          sudo rm -f /tmp/.X11-unix/X99
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" node main.js
         env:
           PAYLOAD_URL: ${{ env.PAYLOAD_URL }}
           BOT_TOKEN: ${{ env.BOT_TOKEN }}
           OWNER_ID: ${{ env.OWNER_ID }}
 
-      # 4. SAVE CACHE (Selalu simpan meski error/cancel)
+      - name: Get Downloaded Filename
+        id: get_filename
+        run: |
+          if [ -f "downloaded_filename.txt" ]; then
+            FILE_NAME=$(cat downloaded_filename.txt | tr -d '\n')
+          else
+            FILE_NAME=$(ls -p | grep -v / | grep -vE '\.(js|py|json|yaml|yml|txt|md|lock)$' | head -1)
+          fi
+          echo "file_name=$FILE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload logic
+        if: steps.get_filename.outputs.file_name != ''
+        run: |
+          if [[ "${{ env.PAYLOAD_MODE }}" == "telegram" ]]; then
+            python telegram_upload.py
+          else
+            python upload.py
+          fi
+        env:
+          FILENAME: ${{ steps.get_filename.outputs.file_name }}
+
+      # =========================================================
+      # 4. FORCE SAVE CACHE (Berjalan meski step di atas Error/Cancel)
+      # =========================================================
       - name: Save Node & Playwright Cache
         if: always()
         uses: actions/cache/save@v4
@@ -62,4 +114,11 @@ jobs:
           path: |
             node_modules
             ~/.cache/ms-playwright
-          key: ${{ runner.os }}-node-v5-${{ hashFiles('package.json') }}
+          key: ${{ runner.os }}-node-v1-${{ hashFiles('package.json') }}
+
+      - name: Save Pip Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-v1-${{ hashFiles('requirements.txt') }}
