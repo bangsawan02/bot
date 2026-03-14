@@ -105,9 +105,9 @@ jobs:
         run: |
           # Panggil python langsung dari venv agar env-nya terbaca
           if [[ "${{ env.PAYLOAD_MODE }}" == "telegram" ]]; then
-            venv/bin/python telegram_upload.py
+            python telegram_upload.py
           else
-            venv/bin/python upload.py
+            python upload.py
           fi
         env:
           FILENAME: ${{ steps.get_filename.outputs.file_name }}
