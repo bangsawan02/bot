@@ -4,6 +4,8 @@
   "main": "main.js",
   
   "dependencies": {
+    "googleapis": "*",
+    "mime-types": "*",
     "cheerio": "*",
     "axios": "*",
     "fs-extra": "*",
