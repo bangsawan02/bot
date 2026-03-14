@@ -37,14 +37,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-node-v1-
 
-      - name: Restore Python Venv Cache
-        id: restore-venv
-        uses: actions/cache/restore@v4
-        with:
-          path: .venv
-          key: ${{ runner.os }}-venv-v1-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-venv-v1-
+
 
       # =========================================================
       # 2. INSTALLATION
@@ -54,20 +47,6 @@ jobs:
           npm install
           npx playwright install chromium 
 
-      - name: dependency pip 
-        run: |
-          # 1. Setup Venv
-          python -m venv .venv
-          source .venv/bin/activate
-          echo ".venv/bin" >> $GITHUB_PATH
-
-          # 2. Instalasi Pustaka Python (Hanya jika cache venv miss)
-          if [ "${{ steps.restore-venv.outputs.cache-hit }}" != "true" ]; then
-            echo "Installing Python dependencies (Venv Cache Miss)..."
-            pip install -r requirements.txt
-          else
-            echo "Venv cache hit. Skipping pip install."
-          fi
 
       - name: Install System Tools (Aria2 & Tools)
         run: |
@@ -107,7 +86,7 @@ jobs:
           if [[ "${{ env.PAYLOAD_MODE }}" == "telegram" ]]; then
             python telegram_upload.py
           else
-            python upload.py
+            node upload.js
           fi
         env:
           FILENAME: ${{ steps.get_filename.outputs.file_name }}
@@ -124,9 +103,4 @@ jobs:
             ~/.cache/ms-playwright
           key: ${{ runner.os }}-node-v1-${{ hashFiles('package.json') }}
 
-      - name: Save Python Venv Cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .venv
-          key: ${{ runner.os }}-venv-v1-${{ hashFiles('requirements.txt') }}
+      
