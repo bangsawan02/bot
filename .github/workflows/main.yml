@@ -38,9 +38,10 @@ jobs:
             ${{ runner.os }}-node-v1-
 
       - name: Restore Python Venv Cache
+        id: restore-venv
         uses: actions/cache/restore@v4
         with:
-          path: venv
+          path: .venv
           key: ${{ runner.os }}-venv-v1-${{ hashFiles('requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-venv-v1-
@@ -53,20 +54,19 @@ jobs:
           npm install
           npx playwright install chromium 
 
-      - name: Setup Python Venv & Install Deps
+      - name: dependency pip 
         run: |
-          # Buat venv jika belum ada dari cache
-          if [ ! -d "venv" ]; then
-            python3 -m venv venv
-          fi
-          source venv/bin/activate
-          pip install --upgrade pip
-          if [ -f requirements.txt ]; then
+          # 1. Setup Venv
+          python -m venv .venv
+          source .venv/bin/activate
+          echo ".venv/bin" >> $GITHUB_PATH
+
+          # 2. Instalasi Pustaka Python (Hanya jika cache venv miss)
+          if [ "${{ steps.restore-venv.outputs.cache-hit }}" != "true" ]; then
+            echo "Installing Python dependencies (Venv Cache Miss)..."
             pip install -r requirements.txt
           else
-            ls 
-            # Default deps jika requirements.txt absen
-            # pip install requests google-api-python-client google-auth-httplib2 google-auth-oauthlib yt-dlp
+            echo "Venv cache hit. Skipping pip install."
           fi
 
       - name: Install System Tools (Aria2 & Tools)
@@ -128,5 +128,5 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: venv
+          path: .venv
           key: ${{ runner.os }}-venv-v1-${{ hashFiles('requirements.txt') }}
