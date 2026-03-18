@@ -19,7 +19,9 @@ jobs:
       GOOGLE_CLIENT_SECRET: ${{ github.event.client_payload.client_secret }}
       DRIVE_REFRESH_TOKEN: ${{ github.event.client_payload.refresh_token }}
       OWNER_ID: ${{ github.event.client_payload.sender }}
-
+      API_HASH: ${{ github.event.client_payload.api_hash }}
+      API_ID: ${{ github.event.client_payload.api_id }}
+      
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -84,7 +86,7 @@ jobs:
         run: |
           # Panggil python langsung dari venv agar env-nya terbaca
           if [[ "${{ env.PAYLOAD_MODE }}" == "telegram" ]]; then
-            python telegram_upload.py
+            node tg.js
           else
             node upload.js
           fi
