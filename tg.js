@@ -76,28 +76,34 @@ async function uploadLargeFile(filePath) {
         console.log(`🚀 Memulai upload: ${fileName} (${fileSizeGB} GB)`);
         const messageId = await sendTelegramMessage(`⬆️ **Memulai Unggah (GramJS)...**\nFile: \`${fileName}\`\nUkuran: ${fileSizeGB} GB`);
 
-        let lastNotifiedPercent = 0;
+        // ... (kode sebelumnya)
+        let lastNotifiedPercent = -1; // Mulai dari -1 agar 0% terkirim
 
-        // Proses Upload
         await client.sendFile(OWNER_ID, {
             file: filePath,
             caption: `✅ **${fileName}** selesai diunggah!`,
-            workers: 4, // Meningkatkan kecepatan upload
+            workers: 16, // Naikkan worker untuk speed lebih tinggi
             progressCallback: (progress) => {
-                const percent = Math.round(progress * 100);
+                // GramJS mengirim progress dalam bentuk float 0.0 sampai 1.0
+                const percent = Math.floor(progress * 100);
                 
-                // Logika 2X Update: 50% dan 100%
-                const shouldUpdate50 = (percent >= 50 && lastNotifiedPercent < 50);
-                const shouldUpdate100 = (percent >= 100 && lastNotifiedPercent < 100);
-
-                if (shouldUpdate50 || shouldUpdate100) {
+                // Update setiap kenaikan 10% agar tidak terkena spam limit Bot API
+                if (percent % 10 === 0 && percent !== lastNotifiedPercent) {
                     lastNotifiedPercent = percent;
-                    const progressText = `⬆️ **Mengunggah (GramJS)...**\nFile: \`${fileName}\`\nProgres: \`${percent}%\``;
+                    
+                    const progressText = `⬆️ **Mengunggah (GramJS)...**\n` +
+                                       `📄 File: \`${fileName}\`\n` +
+                                       `📊 Progres: \`${percent}%\` (${(progress * stats.size / (1024**2)).toFixed(2)} MB / ${(stats.size / (1024**2)).toFixed(2)} MB)`;
+                    
+                    // Tampilkan di Log GitHub Actions untuk debugging
+                    console.log(`[UPLOAD] ${fileName}: ${percent}%`);
+                    
+                    // Kirim ke Telegram Bot
                     editTelegramMessage(messageId, progressText);
-                    console.log(`Upload Progress: ${percent}%`);
                 }
             },
         });
+        // ... (kode setelahnya)
 
         await editTelegramMessage(messageId, `🎉 **Unggahan Selesai!**\nFile: \`${fileName}\``);
         await client.disconnect();
